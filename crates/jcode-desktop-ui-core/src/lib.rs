@@ -22,3 +22,4 @@ pub mod scrollbar;
 pub mod text_selection;
 pub mod theme;
 pub mod transition;
+pub mod zoom;
