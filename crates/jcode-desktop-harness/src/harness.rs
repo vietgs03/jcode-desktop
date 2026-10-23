@@ -109,6 +109,11 @@ pub enum Update {
         messages: Vec<jcode_sdk::HistoryMessage>,
         images: Vec<jcode_sdk::RenderedImage>,
     },
+    /// A remote session's stored tail, shown until `History` replaces it.
+    ProvisionalHistory {
+        session_id: String,
+        messages: Vec<jcode_sdk::HistoryMessage>,
+    },
     /// A streaming event for one session. The worker supplies the session id
     /// because some important events (notably errors) do not include one.
     Event {
@@ -196,6 +201,14 @@ pub enum Command {
     /// Open a dedicated connection for this session (attach + stream).
     Watch {
         session_id: String,
+    },
+    /// Paint a remote session's stored tail while its worker attaches.
+    /// Attaching restores the agent first, which takes tens of seconds for a
+    /// large transcript. `peek_session` reads the stored record without
+    /// attaching, so the panel shows the latest messages almost immediately.
+    PeekRemote {
+        session_id: String,
+        limit: u32,
     },
     /// Drop a session's dedicated connection.
     Unwatch {
@@ -931,6 +944,14 @@ fn run_with_transports(
             }
             Command::Watch { session_id } => {
                 ensure_session_worker(&mut workers, session_id, &updates, &transports);
+            }
+            Command::PeekRemote { session_id, limit } => {
+                let updates = updates.clone();
+                let transports = transports.clone();
+                std::thread::Builder::new()
+                    .name("jcode-bridge-peek".into())
+                    .spawn(move || peek_remote(session_id, limit, &updates, &transports))
+                    .expect("spawn remote peek thread");
             }
             Command::Unwatch { session_id } => {
                 if let Some(worker) = workers.remove(&session_id) {
@@ -1836,6 +1857,42 @@ fn wsl_history_host() -> Option<String> {
         .trim()
         .to_owned();
     jcode_sdk::wsl_distro(&host).is_some().then_some(host)
+}
+
+/// See [`Command::PeekRemote`]. Delivered as `Update::ProvisionalHistory` so
+/// the panel treats it like the local disk prefix: replaced by the attached
+/// session's authoritative history, never merged with it.
+fn peek_remote(
+    session_id: String,
+    limit: u32,
+    updates: &UpdateSender,
+    transports: &transport::RemoteTransports,
+) {
+    let Ok(address) = remote::SessionAddress::parse(&session_id) else {
+        return;
+    };
+    let Some(host) = address.host.as_deref() else {
+        return;
+    };
+    let started = std::time::Instant::now();
+    let result = transports
+        .connect(host)
+        .and_then(|client| client.peek_session(&address.session_id, Some(limit)));
+    match result {
+        Ok(messages) if !messages.is_empty() => {
+            eprintln!(
+                "jcode desktop: peeked {} messages of {session_id} in {:.1}ms",
+                messages.len(),
+                started.elapsed().as_secs_f64() * 1_000.0
+            );
+            let _ = updates.send(Update::ProvisionalHistory {
+                session_id,
+                messages,
+            });
+        }
+        Ok(_) => {}
+        Err(error) => eprintln!("jcode desktop: peek of {session_id} failed: {error}"),
+    }
 }
 
 fn ensure_session_worker(

@@ -99,9 +99,11 @@ fn local_draft_entrance_slides_a_full_width_editor(cx: &mut gpui::TestAppContext
         assert_eq!(opening.sample(now + duration), 0.0);
         assert!(!opening.is_animating());
 
+        // Windows opens chats full width and keeps the incumbent full width.
+        let expected = if cfg!(windows) { 1.0 } else { DEFAULT_WIDTH };
         for slot in &w.slots {
             let mut width = slot.animated_width;
-            assert_eq!(width.sample(before), DEFAULT_WIDTH);
+            assert_eq!(width.sample(before), expected);
             assert!(
                 !width.is_animating(),
                 "motion must not collapse the editor width"
@@ -586,7 +588,9 @@ fn empty_strip_shows_hint_offline_and_spawns_full_then_half_width(cx: &mut gpui:
             .row_indices(1)
             .map(|i| w.slots[i].width_fraction)
             .collect::<Vec<_>>();
-        assert_eq!(widths, vec![0.5, 0.5]);
+        // Windows opens every chat full width; elsewhere the pair splits.
+        let pair = if cfg!(windows) { 1.0 } else { 0.5 };
+        assert_eq!(widths, vec![pair, pair]);
         assert_eq!(w.slots[0].width_fraction, DEFAULT_WIDTH);
     });
 }

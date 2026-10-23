@@ -783,6 +783,7 @@ impl Workspace {
         }
         self.remotes.input = None;
         self.focus_pending = true;
+        self.promote_lone_panel(self.active_row);
         self.retarget_camera();
         cx.notify();
     }

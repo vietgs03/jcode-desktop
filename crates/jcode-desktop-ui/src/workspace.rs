@@ -2294,6 +2294,19 @@ impl Workspace {
                 self.set_active(inserted, cx);
                 self.focus_pending = true;
             }
+            Update::ProvisionalHistory {
+                session_id,
+                messages,
+            } => {
+                for slot in &self.slots {
+                    if slot.panel.read(cx).session_id == session_id {
+                        slot.panel.update(cx, |panel, cx| {
+                            panel.show_provisional_history(messages, cx);
+                        });
+                        break;
+                    }
+                }
+            }
             Update::History {
                 session_id,
                 messages,
@@ -2581,11 +2594,12 @@ impl Workspace {
             .animated_width
             .set(width_fraction, Instant::now());
         // The lone panel that had the whole viewport steps back to the default
-        // width now that it has company, leaving two equal halves.
+        // width now that it has company, leaving two equal halves. On Windows
+        // chats open full width, so the incumbent keeps full width as well.
         let strip_panels = self.row_indices(self.active_row).count();
         let now = Instant::now();
         for index in self.row_indices(self.active_row).collect::<Vec<_>>() {
-            if index == insert_at {
+            if index == insert_at || width_fraction >= 1.0 {
                 continue;
             }
             let slot = &mut self.slots[index];
@@ -2779,6 +2793,26 @@ impl Workspace {
         // Camera target is resolved during render when the viewport width is
         // known; setting a sentinel forces recomputation.
         self.camera_dirty[self.active_row] = true;
+    }
+
+    /// Called when a panel leaves `row` (closed, dismissed or moved away). If a
+    /// single panel remains it owns the viewport again, the inverse of the
+    /// demotion that halved it when its neighbour arrived. Only departures
+    /// promote, so a lone panel can still be narrowed deliberately.
+    pub(super) fn promote_lone_panel(&mut self, row: usize) {
+        let mut surviving = self
+            .slots
+            .iter_mut()
+            .filter(|slot| slot.row == row && !slot.closing);
+        let (Some(slot), None) = (surviving.next(), surviving.next()) else {
+            return;
+        };
+        let width = promoted_width(slot.width_fraction, 1);
+        if width != slot.width_fraction {
+            slot.width_fraction = width;
+            slot.animated_width.set(width, Instant::now());
+            slot.restore_fraction = None;
+        }
     }
 
     /// Resolve the strip's scroll offset. This follows niri's
@@ -3194,10 +3228,12 @@ impl Workspace {
             return;
         }
         self.begin_map_navigation(target as usize);
+        let source_row = self.active_row;
         let slot = &mut self.slots[self.active];
         slot.row = target as usize;
         self.active_row = target as usize;
         self.row_focus[self.active_row] = Some(slot.panel.entity_id());
+        self.promote_lone_panel(source_row);
         self.retarget_camera();
         self.focus_active(window, cx);
         self.learned("move_panel_strip", cx);
@@ -3944,6 +3980,7 @@ impl Workspace {
             .get(self.active)
             .filter(|slot| slot.row == self.active_row && !slot.closing)
             .map(|slot| slot.panel.entity_id());
+        self.promote_lone_panel(self.active_row);
         self.retarget_camera();
         self.focus_active(window, cx);
         cx.notify();
@@ -9269,6 +9306,17 @@ fn demoted_width(width: f32, panels_after_spawn: usize) -> f32 {
     }
 }
 
+/// The inverse of `demoted_width`: once a strip is back to a single panel, that
+/// panel owns the viewport again. Leaving it stranded at half width after its
+/// neighbour closed wastes the screen and needs a manual maximize.
+fn promoted_width(width: f32, surviving_panels: usize) -> f32 {
+    if surviving_panels == 1 && width < 1.0 {
+        1.0
+    } else {
+        width
+    }
+}
+
 /// A one-line description of the strip layout, for tests and for the
 /// `JCODE_DESKTOP_STATE` debug dump: `strip=<row> focus=<pos> widths=a,b,c`.
 fn describe_strip(widths: &[f32], focus_position: Option<usize>, row: usize) -> String {
@@ -14511,15 +14559,18 @@ mod tests {
     #[test]
     fn first_spawn_fills_the_viewport_and_later_spawns_use_the_default_width() {
         assert_eq!(spawned_panel_width(0), 1.0);
-        assert_eq!(spawned_panel_width(1), DEFAULT_WIDTH);
-        assert_eq!(spawned_panel_width(4), DEFAULT_WIDTH);
+        let later = if cfg!(windows) { 1.0 } else { DEFAULT_WIDTH };
+        assert_eq!(spawned_panel_width(1), later);
+        assert_eq!(spawned_panel_width(4), later);
     }
 
     #[test]
     fn the_lone_full_width_panel_halves_when_a_second_one_spawns() {
         // Spawning the second panel leaves two equal halves: the newcomer opens
         // at the default width and the incumbent gives up the extra space.
-        assert_eq!(spawned_panel_width(1), DEFAULT_WIDTH);
+        // Windows opens every chat at full width instead.
+        let later = if cfg!(windows) { 1.0 } else { DEFAULT_WIDTH };
+        assert_eq!(spawned_panel_width(1), later);
         assert_eq!(demoted_width(1.0, 2), DEFAULT_WIDTH);
         // Every later spawn leaves the existing panels untouched, so the strip
         // keeps scrolling at the default width.
@@ -14528,6 +14579,16 @@ mod tests {
         // A width the user picked is never overridden.
         assert_eq!(demoted_width(0.25, 2), 0.25);
         assert_eq!(demoted_width(0.75, 2), 0.75);
+    }
+
+    #[test]
+    fn the_last_panel_left_in_a_strip_takes_the_full_width_back() {
+        assert_eq!(promoted_width(DEFAULT_WIDTH, 1), 1.0);
+        assert_eq!(promoted_width(0.25, 1), 1.0);
+        assert_eq!(promoted_width(1.0, 1), 1.0);
+        // With company, widths stay exactly as they were.
+        assert_eq!(promoted_width(DEFAULT_WIDTH, 2), DEFAULT_WIDTH);
+        assert_eq!(promoted_width(0.75, 3), 0.75);
     }
 
     #[test]
@@ -15442,6 +15503,10 @@ mod sound_settings;
 #[cfg(test)]
 #[path = "workspace_login_tests.rs"]
 mod login_tests;
+
+#[cfg(test)]
+#[path = "workspace_layout_tests.rs"]
+mod layout_tests;
 
 #[cfg(test)]
 mod accounts_panel_tests {

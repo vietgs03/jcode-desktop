@@ -130,6 +130,11 @@ unsafe extern "C-unwind" fn terminal_create(
 }
 
 fn spawn_terminal(working_dir: Option<&str>) -> anyhow::Result<TerminalResource> {
+    #[cfg(windows)]
+    {
+        return spawn_terminal_command(windows_terminal_command(working_dir));
+    }
+    #[allow(unreachable_code)]
     let shell = default_shell();
     let is_fish = shell.ends_with("/fish") || shell == "fish";
     let mut command = CommandBuilder::new(shell);
@@ -336,6 +341,65 @@ fn default_shell() -> String {
         }
     }
     std::env::var("SHELL").unwrap_or_else(|_| "sh".into())
+}
+
+/// Windows has no `sh`, so the POSIX default exits immediately and the panel
+/// shows a dead terminal. When the default machine is a WSL distribution the
+/// user's work lives there, so open a login shell in its home directory.
+/// Otherwise use PowerShell in the requested Windows directory.
+#[cfg(windows)]
+fn windows_terminal_command(working_dir: Option<&str>) -> CommandBuilder {
+    let mut command = match wsl_default_host() {
+        Some(host) => {
+            let mut command = CommandBuilder::new("wsl.exe");
+            if let Some(distro) = host
+                .to_ascii_lowercase()
+                .strip_suffix(".wsl")
+                .map(|stem| host[..stem.len()].to_owned())
+                .filter(|stem| !stem.is_empty())
+            {
+                command.arg("--distribution");
+                command.arg(distro);
+            }
+            command.arg("--cd");
+            command.arg("~");
+            command
+        }
+        None => {
+            let mut command = CommandBuilder::new("powershell.exe");
+            command.arg("-NoLogo");
+            if let Some(dir) = working_dir {
+                command.cwd(dir);
+            }
+            command
+        }
+    };
+    command.env("TERM", "xterm-256color");
+    command.env("TERM_PROGRAM", "jcode-desktop");
+    command.env("COLORTERM", "truecolor");
+    command
+}
+
+/// `[desktop.workspace] default_remote_host` when it names a WSL target
+/// (`wsl` or `<Distro>.wsl`), read from the shared Jcode config.
+#[cfg(windows)]
+fn wsl_default_host() -> Option<String> {
+    let path = std::env::var_os("JCODE_HOME")
+        .map(std::path::PathBuf::from)
+        .or_else(|| std::env::var_os("USERPROFILE").map(|home| std::path::PathBuf::from(home).join(".jcode")))?
+        .join("config.toml");
+    let text = std::fs::read_to_string(path).ok()?;
+    let host = text
+        .lines()
+        .map(str::trim)
+        .find_map(|line| line.strip_prefix("default_remote_host"))?
+        .trim_start()
+        .strip_prefix('=')?
+        .trim()
+        .trim_matches(|c| c == '"' || c == '\'')
+        .to_owned();
+    let lower = host.to_ascii_lowercase();
+    (lower == "wsl" || (lower.ends_with(".wsl") && lower.len() > 4)).then_some(host)
 }
 
 #[cfg(test)]

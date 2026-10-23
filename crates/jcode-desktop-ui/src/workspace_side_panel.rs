@@ -257,6 +257,8 @@ impl Workspace {
             self.set_active(self.active, cx);
             self.focus_pending = true;
         }
+        // Removed tool documents can leave the chat alone in its strip.
+        self.promote_lone_panel(row);
         self.camera_dirty[row] = true;
         cx.notify();
         true

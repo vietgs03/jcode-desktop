@@ -125,6 +125,7 @@ impl Workspace {
         {
             self.row_focus[self.active_row] = Some(slot.panel.entity_id());
         }
+        self.promote_lone_panel(self.active_row);
         self.retarget_camera();
     }
 

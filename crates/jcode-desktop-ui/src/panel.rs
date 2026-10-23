@@ -159,6 +159,9 @@ pub(crate) type SessionOpener =
 // Keep the last message/card clear of the composer and its metadata. This is
 // outside the scrolling list so it remains visible even while reading history.
 const TRANSCRIPT_BOTTOM_GAP: f32 = 12.0;
+/// Stored messages shown while a remote session attaches. Enough to read the
+/// latest exchange and its tools, small enough to arrive in well under a second.
+const REMOTE_PEEK_MESSAGES: u32 = 80;
 
 fn command_unavailable_message(input: &str) -> String {
     let name = input.split_whitespace().next().unwrap_or(input);
@@ -2522,12 +2525,50 @@ impl Panel {
             return;
         }
         let id = self.session_id.clone();
+        if crate::harness::remote_host(&id).is_some() {
+            // Remote records live on the other machine. Ask the bridge for the
+            // stored tail without attaching (see `Command::PeekRemote`).
+            if self.can_show_provisional() {
+                self.awaiting_persisted = true;
+                self.bridge.send(Command::PeekRemote {
+                    session_id: id,
+                    limit: REMOTE_PEEK_MESSAGES,
+                });
+            }
+            return;
+        }
         if !crate::persisted_history::is_local_session_id(&id)
             || !jcode_base::session::session_path(&id).is_ok_and(|path| path.exists())
         {
             return;
         }
         self.prefetch_history_with(move || crate::persisted_history::load(&id), cx);
+    }
+
+    /// Show a remote session's peeked tail until the attached history lands.
+    pub fn show_provisional_history(
+        &mut self,
+        messages: Vec<jcode_sdk::HistoryMessage>,
+        cx: &mut Context<Self>,
+    ) {
+        if !std::mem::take(&mut self.awaiting_persisted) || !self.can_show_provisional() {
+            return;
+        }
+        let items = Self::history_items(messages, Vec::new());
+        if items.is_empty() {
+            cx.notify();
+            return;
+        }
+        self.provisional_items = items.len();
+        *self.items = items;
+        self.transcript_measurements.dirty = true;
+        if self.startup_layout.as_ref().is_some_and(|l| !l.committed) {
+            self.startup_layout = None;
+        }
+        if self.pending_history_scroll.is_none() && self.stick_to_bottom {
+            self.transcript_list.scroll_to_end();
+        }
+        cx.notify();
     }
 
     pub(crate) fn prefetch_history_with(
