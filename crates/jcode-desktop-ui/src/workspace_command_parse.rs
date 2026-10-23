@@ -17,6 +17,7 @@ pub(crate) enum WorkspaceCommand {
     Selfdev(String),
     Transfer,
     Publish,
+    Worktree(String),
     Invalid(&'static str),
 }
 
@@ -44,6 +45,7 @@ pub(crate) fn parse(content: &str) -> Option<WorkspaceCommand> {
         "/server-reload" if tail.is_empty() => ServerReload,
         "/server-reload" => Invalid("Usage: /server-reload"),
         "/selfdev" => Selfdev(tail.into()),
+        "/worktree" | "/wt" => Worktree(tail.into()),
         "/back" if tail.is_empty() => Back,
         "/workspace" if tail.is_empty() => Workspace,
         "/quit" if tail.is_empty() => Quit,

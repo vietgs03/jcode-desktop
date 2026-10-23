@@ -229,7 +229,64 @@ impl Workspace {
             WorkspaceCommand::Invalid(message) => {
                 source.update(cx, |panel, cx| panel.workspace_command_notice(message, cx))
             }
+            WorkspaceCommand::Worktree(branch) => self.slash_worktree(source, branch, cx),
         }
+    }
+
+    /// `/worktree <branch>`: create the branch from HEAD in a sibling checkout
+    /// on the same machine as this session (local or WSL), then open a new chat
+    /// there. The original checkout and its uncommitted work are untouched.
+    fn slash_worktree(&mut self, source: Entity<Panel>, branch: String, cx: &mut Context<Self>) {
+        use jcode_desktop_harness::session_git::{Location, create_worktree};
+        let (session_id, directory) = {
+            let panel = source.read(cx);
+            (panel.session_id.clone(), panel.working_dir.clone())
+        };
+        let Some(location) = Location::of_session(&session_id) else {
+            source.update(cx, |panel, cx| panel.workspace_command_notice("Worktrees are supported for local and WSL sessions, not other SSH hosts.", cx));
+            return;
+        };
+        let Some(directory) = directory.filter(|dir| !dir.trim().is_empty()) else {
+            source.update(cx, |panel, cx| panel.workspace_command_notice("This session has no working directory, so there is no repository to branch from.", cx));
+            return;
+        };
+        if branch.is_empty() {
+            source.update(cx, |panel, cx| panel.workspace_command_notice("Usage: `/worktree <new-branch>`. Creates `<repo>-worktrees/<branch>` from HEAD and opens a chat there. Your current checkout is not touched.", cx));
+            return;
+        }
+        source.update(cx, |panel, cx| {
+            panel.workspace_command_notice(format!("Creating worktree `{branch}` from HEAD of `{directory}`…"), cx)
+        });
+        let task = cx.background_executor().spawn({
+            let location = location.clone();
+            async move { create_worktree(&location, &directory, &branch).map(|path| (path, branch)) }
+        });
+        cx.spawn(async move |this, cx| {
+            let result = task.await;
+            let _ = this.update(cx, |this, cx| match result {
+                Ok((path, branch)) => {
+                    source.update(cx, |panel, cx| panel.workspace_command_notice(format!("Worktree ready: branch `{branch}` at `{path}`. Opened a new chat there. Merge or remove it with git when done (`git worktree remove`)."), cx));
+                    this.focus_pending = true;
+                    match location.host() {
+                        None => this.open_local_draft(Some(path), cx),
+                        Some(host) => {
+                            let request_id = pending::next_remote_draft_id(&host);
+                            this.mount_session_draft(request_id.clone(), Some(path.clone()), format!("{branch} · worktree"), cx);
+                            this.bridge.send(Command::CreateRemoteSession {
+                                host,
+                                working_dir: Some(path),
+                                request_id: Some(request_id),
+                            });
+                        }
+                    }
+                    cx.notify();
+                }
+                Err(error) => source.update(cx, |panel, cx| {
+                    panel.workspace_command_notice(format!("Could not create the worktree: {error}"), cx)
+                }),
+            });
+        })
+        .detach();
     }
 
     /// Call once after snapshot slots have been restored. Observers belong to the

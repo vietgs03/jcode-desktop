@@ -79,20 +79,42 @@ impl Panel {
                 crate::build_info::version(), crate::build_info::revision(), crate::build_info::age(),
                 std::env::consts::OS, std::env::consts::ARCH
             ))),
-            "/git" | "/diff" => {
-                let diff = command == "/diff";
+            "/git" | "/changes" => {
+                let diff = command == "/changes";
                 let staged = args == "--staged" || args == "--cached";
+                let location = jcode_desktop_harness::session_git::Location::of_session(&self.session_id);
                 if !args.is_empty() && !(diff && staged) {
                     self.items.push(Item::Error(format!("Usage: `{command}{}`.", if diff { " [--staged]" } else { "" })));
-                } else if crate::harness::remote_host(&self.session_id).is_some() {
+                } else if location.is_none() {
                     self.items.push(Item::Error(format!("{command} cannot inspect the remote checkout from this Desktop. Open the session's remote terminal to run `git {}` there.", if diff { "diff" } else { "status" })));
                 } else if let Some(directory) = self.working_dir.clone().filter(|dir| !dir.trim().is_empty()) {
+                    let location = location.expect("checked above");
                     self.items.push(Item::Assistant(format!("Reading {} in `{directory}`…", if diff { "git diff" } else { "git status" })));
                     cx.spawn(async move |this, cx| {
-                        let result = cx.background_executor().spawn(async move { git_read(&directory, diff, staged) }).await;
+                        let result = cx.background_executor().spawn(async move {
+                            if diff {
+                                git_diff_patch(&location, &directory, staged).map(Ok)
+                            } else {
+                                git_read(&location, &directory, false, false).map(Err)
+                            }
+                        }).await;
                         let _ = this.update(cx, |panel, cx| {
                             panel.items.push(match result {
-                                Ok(text) => Item::Assistant(text),
+                                // A real working-tree diff, shown with the same
+                                // per-file cards and Review panel as agent edits.
+                                Ok(Ok(Some(patch))) => Item::Tool {
+                                    call_id: format!("git-diff-{}", panel.items.len()),
+                                    name: "apply_patch".into(),
+                                    input: serde_json::json!({
+                                        "intent": if staged { "Staged changes (git diff --staged)" } else { "Working tree changes (git diff)" },
+                                        "patch_text": patch,
+                                    }).to_string(),
+                                    output: String::new(),
+                                    done: true,
+                                    error: None,
+                                },
+                                Ok(Ok(None)) => Item::Assistant("No tracked-file changes in this diff. Untracked files appear in `/git`.".into()),
+                                Ok(Err(text)) => Item::Assistant(text),
                                 Err(error) => Item::Error(error),
                             });
                             panel.transcript_measurements.dirty = true;
@@ -401,37 +423,58 @@ fn valid_session_filename(id: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
 }
 
-fn git_read(directory: &str, diff: bool, staged: bool) -> Result<String, String> {
-    let mut command = std::process::Command::new("git");
-    command
-        .current_dir(directory)
-        .env("GIT_OPTIONAL_LOCKS", "0")
-        .args([
-            "--no-pager",
-            "-c",
-            "color.ui=false",
-            "-c",
-            "core.fsmonitor=false",
-        ]);
+/// The working-tree diff as a unified patch, or `None` when there are no
+/// tracked changes. Bounded so a huge diff cannot stall the transcript.
+fn git_diff_patch(
+    location: &jcode_desktop_harness::session_git::Location,
+    directory: &str,
+    staged: bool,
+) -> Result<Option<String>, String> {
+    // Override diff.mnemonicPrefix/noprefix so paths always use a/ and b/.
+    let mut args = vec![
+        "diff",
+        "--no-ext-diff",
+        "--no-textconv",
+        "--no-color",
+        "-M",
+        "--src-prefix=a/",
+        "--dst-prefix=b/",
+    ];
+    if staged {
+        args.push("--cached");
+    }
+    let patch = location.git(directory, &args)?;
+    if patch.trim().is_empty() {
+        return Ok(None);
+    }
+    const LIMIT: usize = 2 * 1024 * 1024;
+    if patch.len() > LIMIT {
+        let mut end = LIMIT;
+        while !patch.is_char_boundary(end) {
+            end -= 1;
+        }
+        let cut = patch[..end].rfind("\ndiff --git ").map_or(end, |index| index + 1);
+        return Ok(Some(patch[..cut].to_owned()));
+    }
+    Ok(Some(patch))
+}
+
+fn git_read(
+    location: &jcode_desktop_harness::session_git::Location,
+    directory: &str,
+    diff: bool,
+    staged: bool,
+) -> Result<String, String> {
+    let mut args = Vec::new();
     if diff {
-        command.args(["diff", "--no-ext-diff", "--no-textconv"]);
+        args.extend(["diff", "--no-ext-diff", "--no-textconv"]);
         if staged {
-            command.arg("--cached");
+            args.push("--cached");
         }
     } else {
-        command.args(["status", "--short", "--branch", "--untracked-files=normal"]);
+        args.extend(["status", "--short", "--branch", "--untracked-files=normal"]);
     }
-    jcode_desktop_harness::platform::no_console_window(&mut command);
-    let output = command
-        .output()
-        .map_err(|error| format!("Could not run git: {error}"))?;
-    if !output.status.success() {
-        return Err(format!(
-            "Git failed: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        ));
-    }
-    let output = String::from_utf8_lossy(&output.stdout);
+    let output = location.git(directory, &args)?;
     if output.trim().is_empty() {
         return Ok(if diff {
             "No tracked-file changes in this diff. Untracked files appear in `/git`."
@@ -625,16 +668,18 @@ mod tests {
         assert!(status.success());
         std::fs::write(directory.path().join("untracked.txt"), "hello").unwrap();
         let path = directory.path().to_str().unwrap();
+        let local = jcode_desktop_harness::session_git::Location::Local;
         assert!(
-            git_read(path, false, false)
+            git_read(&local, path, false, false)
                 .unwrap()
                 .contains("untracked.txt")
         );
         assert!(
-            git_read(path, true, false)
+            git_read(&local, path, true, false)
                 .unwrap()
                 .contains("No tracked-file changes")
         );
+        assert_eq!(git_diff_patch(&local, path, false).unwrap(), None);
         assert_eq!(
             std::fs::read_to_string(directory.path().join("untracked.txt")).unwrap(),
             "hello"

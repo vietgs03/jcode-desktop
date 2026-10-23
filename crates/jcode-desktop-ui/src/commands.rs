@@ -59,6 +59,14 @@ pub(crate) const REGISTERED_COMMANDS: &[RegisteredCommand] = &[
     RegisteredCommand::public("/btw", "Ask a side question in the side panel"),
     RegisteredCommand::public("/ssh", "Connect to a remote machine using system SSH"),
     RegisteredCommand::public("/git", "Show git status for the session working directory"),
+    RegisteredCommand::public(
+        "/changes",
+        "Review the working tree's git diff (--staged for the index)",
+    ),
+    RegisteredCommand::public(
+        "/worktree",
+        "Start a branch in its own isolated checkout and open a chat there",
+    ),
     RegisteredCommand::public("/colors", "List or change Desktop color themes"),
     RegisteredCommand::hidden("/color", "Alias for /colors"),
     RegisteredCommand::public("/hotkeys", "List registered Desktop hotkeys and contexts"),
