@@ -718,6 +718,7 @@ for line in sys.stdin:
 
     /// The bundled GitHub applet: launch, list, open a PR, run a write action.
     /// A fake `gh` on PATH stands in for GitHub, so this runs offline.
+    #[cfg(unix)]
     #[test]
     fn bundled_github_applet_renders_valid_documents() {
         use std::os::unix::fs::PermissionsExt;
@@ -956,6 +957,7 @@ else:
     /// The bundled Sheets applet claims `mcp__sheets__*` calls and renders them
     /// as tool cards that pass host validation. A fake `gog` stands in for
     /// Google, so this runs offline.
+    #[cfg(unix)]
     #[test]
     fn bundled_sheets_applet_renders_tool_cards() {
         use std::os::unix::fs::PermissionsExt;
