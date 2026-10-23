@@ -21,6 +21,9 @@ mod spawn_profile;
 #[path = "remote.rs"]
 mod remote;
 
+#[path = "swarm_state.rs"]
+pub mod swarm_state;
+
 #[cfg(unix)]
 #[path = "harness_transport.rs"]
 mod transport;
@@ -92,6 +95,11 @@ pub enum Update {
     /// The initial session list, fetched in the background.
     Sessions {
         sessions: Vec<SessionInfo>,
+    },
+    /// Swarm members (local and WSL) keyed by Desktop session ID, sent just
+    /// before each refreshed session list. Feeds the Agents board.
+    SwarmState {
+        roster: swarm_state::Roster,
     },
     /// A session was created (in reply to `Command::CreateSession`).
     SessionCreated {
@@ -1229,6 +1237,7 @@ fn refresh_sessions(
             jcode_sdk::enrich_sessions_from_local_swarm_state(&mut sessions);
             jcode_sdk::enrich_sessions_from_local_edit_stats(&mut sessions);
             merge_wsl_sessions(&mut sessions);
+            refresh_swarm_state(&mut sessions, &updates);
             eprintln!(
                 "jcode desktop: session list completed in {:.1}ms ({} sessions)",
                 started.elapsed().as_secs_f64() * 1_000.0,
@@ -1840,6 +1849,18 @@ fn merge_wsl_sessions(sessions: &mut Vec<SessionInfo>) {
             .or_else(|| session_recency_ms(&session.session_id))
             .unwrap_or_default()
     });
+}
+
+/// Read swarm snapshots from this machine and the WSL history host, fill
+/// ownership on WSL sessions (the SDK helper only sees local snapshots), and
+/// publish the roster for the Agents board. Kept apart from the list refresh.
+fn refresh_swarm_state(sessions: &mut [SessionInfo], updates: &UpdateSender) {
+    if screenshot_mode() || cfg!(any(test, feature = "test-support")) {
+        return;
+    }
+    let host = wsl_history_host();
+    let roster = swarm_state::refresh(sessions, host.as_deref());
+    let _ = updates.send(Update::SwarmState { roster });
 }
 
 fn wsl_history_host() -> Option<String> {
