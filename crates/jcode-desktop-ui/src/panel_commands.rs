@@ -99,11 +99,12 @@ impl Panel {
                             }
                         }).await;
                         let _ = this.update(cx, |panel, cx| {
+                            let call_id = format!("git-diff-{}", panel.items.len());
                             panel.items.push(match result {
                                 // A real working-tree diff, shown with the same
                                 // per-file cards and Review panel as agent edits.
                                 Ok(Ok(Some(patch))) => Item::Tool {
-                                    call_id: format!("git-diff-{}", panel.items.len()),
+                                    call_id,
                                     name: "apply_patch".into(),
                                     input: serde_json::json!({
                                         "intent": if staged { "Staged changes (git diff --staged)" } else { "Working tree changes (git diff)" },
