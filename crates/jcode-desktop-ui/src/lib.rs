@@ -208,6 +208,35 @@ pub fn bind_workspace_keys(cx: &mut App) {
         KeyBinding::new("super-2", WidthPreset2, None),
         KeyBinding::new("super-3", WidthPreset3, None),
         KeyBinding::new("super-4", WidthPreset4, None),
+        // Windows owns most Win+letter/number chords (taskbar apps, lock,
+        // dictation, overview), so they never reach the window. Ctrl+Alt
+        // aliases keep the core workspace actions on the keyboard there.
+        #[cfg(windows)]
+        KeyBinding::new("ctrl-alt-1", WidthPreset1, None),
+        #[cfg(windows)]
+        KeyBinding::new("ctrl-alt-2", WidthPreset2, None),
+        #[cfg(windows)]
+        KeyBinding::new("ctrl-alt-3", WidthPreset3, None),
+        #[cfg(windows)]
+        KeyBinding::new("ctrl-alt-4", WidthPreset4, None),
+        #[cfg(windows)]
+        KeyBinding::new("ctrl-alt-w", ClosePanel, None),
+        #[cfg(windows)]
+        KeyBinding::new("ctrl-alt-o", ToggleOverview, None),
+        #[cfg(windows)]
+        KeyBinding::new("ctrl-alt-b", ToggleSidebar, None),
+        #[cfg(windows)]
+        KeyBinding::new("ctrl-alt-home", FocusFirst, None),
+        #[cfg(windows)]
+        KeyBinding::new("ctrl-alt-end", FocusLast, None),
+        #[cfg(windows)]
+        KeyBinding::new("ctrl-alt-shift-left", MovePanelLeft, None),
+        #[cfg(windows)]
+        KeyBinding::new("ctrl-alt-shift-right", MovePanelRight, None),
+        #[cfg(windows)]
+        KeyBinding::new("ctrl-alt-shift-up", MovePanelUp, None),
+        #[cfg(windows)]
+        KeyBinding::new("ctrl-alt-shift-down", MovePanelDown, None),
         KeyBinding::new("super-shift-q", Quit, None),
         KeyBinding::new("ctrl-shift-n", NewPanel, None),
         KeyBinding::new("ctrl-t", NewPanel, None),
