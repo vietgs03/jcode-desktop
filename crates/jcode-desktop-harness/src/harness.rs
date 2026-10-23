@@ -1207,6 +1207,7 @@ fn refresh_sessions(
             let mut sessions = merge_persisted_sessions(api_sessions, home.as_deref());
             jcode_sdk::enrich_sessions_from_local_swarm_state(&mut sessions);
             jcode_sdk::enrich_sessions_from_local_edit_stats(&mut sessions);
+            merge_wsl_sessions(&mut sessions);
             eprintln!(
                 "jcode desktop: session list completed in {:.1}ms ({} sessions)",
                 started.elapsed().as_secs_f64() * 1_000.0,
@@ -1760,6 +1761,81 @@ pub fn merge_persisted_sessions(
             .unwrap_or_else(|| session_recency_ms(&session.session_id).unwrap_or_default())
     });
     sessions
+}
+
+/// On Windows, local history lives in `%USERPROFILE%\.jcode`, while a user who
+/// works inside WSL keeps every session in the distribution's `~/.jcode`. When
+/// a WSL distribution is the default target, list its persisted sessions too,
+/// namespaced as remote IDs so opening one attaches through `wsl.exe`.
+fn merge_wsl_sessions(sessions: &mut Vec<SessionInfo>) {
+    let Some(host) = wsl_history_host() else {
+        return;
+    };
+    let started = std::time::Instant::now();
+    let options = jcode_sdk::SshConnectOptions {
+        client_name: format!("jcode-desktop-wsl-sessions/{}", crate::client_version()),
+        connect_timeout: Duration::from_secs(20),
+        request_timeout: Some(Duration::from_secs(30)),
+        ..jcode_sdk::SshConnectOptions::new(&host)
+    };
+    let remote_sessions = match JcodeClient::connect_ssh(options)
+        .and_then(|client| client.list_sessions_limited(MAX_PERSISTED_SIDEBAR_SESSIONS as u32))
+    {
+        Ok(list) => list,
+        Err(error) => {
+            eprintln!("jcode desktop: {host} session list failed: {error}");
+            return;
+        }
+    };
+    let mut wsl = remote_sessions
+        .into_iter()
+        .filter(|session| !session.archived)
+        .map(|mut session| {
+            session.session_id = remote::namespace(&host, &session.session_id);
+            session.parent_session_id = session
+                .parent_session_id
+                .map(|id| remote::namespace(&host, &id));
+            session
+        })
+        .filter(|session| {
+            !sessions
+                .iter()
+                .any(|known| known.session_id == session.session_id)
+        })
+        .collect::<Vec<_>>();
+    eprintln!(
+        "jcode desktop: {host} session list completed in {:.1}ms ({} sessions)",
+        started.elapsed().as_secs_f64() * 1_000.0,
+        wsl.len()
+    );
+    // Callers keep the list oldest-first (the sidebar shows the newest at the
+    // top), so interleave both machines by their last activity.
+    sessions.append(&mut wsl);
+    sessions.sort_by_key(|session| {
+        session
+            .last_active_at_ms
+            .or(session.updated_at_ms)
+            .and_then(|ms| u128::try_from(ms).ok())
+            .or_else(|| session_recency_ms(&session.session_id))
+            .unwrap_or_default()
+    });
+}
+
+fn wsl_history_host() -> Option<String> {
+    if !cfg!(windows) || screenshot_mode() || cfg!(any(test, feature = "test-support")) {
+        return None;
+    }
+    let config = jcode_home()?.join("config.toml");
+    let text = std::fs::read_to_string(config).ok()?;
+    let value: toml::Value = toml::from_str(&text).ok()?;
+    let host = value
+        .get("desktop")?
+        .get("workspace")?
+        .get("default_remote_host")?
+        .as_str()?
+        .trim()
+        .to_owned();
+    jcode_sdk::wsl_distro(&host).is_some().then_some(host)
 }
 
 fn ensure_session_worker(

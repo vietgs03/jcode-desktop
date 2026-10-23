@@ -87,7 +87,13 @@ pub fn discover_hosts() -> Vec<String> {
     let Some(home) = jcode_desktop_model::platform_dirs::home_dir() else {
         return Vec::new();
     };
-    discover_hosts_at(&home)
+    let mut hosts = discover_hosts_at(&home);
+    // The SDK routes `wsl` through wsl.exe, so the default WSL distribution
+    // is reachable without sshd. Offer it first on Windows.
+    if cfg!(windows) && !hosts.iter().any(|h| h.eq_ignore_ascii_case("wsl")) {
+        hosts.insert(0, "wsl".into());
+    }
+    hosts
 }
 
 fn discover_hosts_at(home: &Path) -> Vec<String> {
