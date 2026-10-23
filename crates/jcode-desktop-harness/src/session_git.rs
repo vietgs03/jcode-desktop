@@ -159,4 +159,31 @@ mod tests {
         assert_eq!(Location::Local.host(), None);
         assert_eq!(Location::Wsl(Some("Ubuntu".into())).host().as_deref(), Some("Ubuntu.wsl"));
     }
+
+    /// Windows only, opt-in: `JCODE_WSL_TEST_REPO=/home/me/repo cargo test`.
+    /// The repo must have an uncommitted change. Creates one new worktree.
+    #[test]
+    fn wsl_diff_and_worktree_leave_the_original_checkout_alone() {
+        let Ok(repo) = std::env::var("JCODE_WSL_TEST_REPO") else {
+            return;
+        };
+        let wsl = Location::of_session("ssh://wsl/session_x").expect("wsl host");
+        assert_eq!(wsl, Location::Wsl(None));
+        let status_before = wsl.git(&repo, &["status", "--porcelain"]).unwrap();
+        assert!(!status_before.trim().is_empty(), "repo needs a pending change");
+        let diff = wsl
+            .git(&repo, &["diff", "--src-prefix=a/", "--dst-prefix=b/"])
+            .unwrap();
+        assert!(diff.contains("--- a/"), "{diff}");
+        let branch = format!("wt-test-{}", std::process::id());
+        let path = create_worktree(&wsl, &repo, &branch).unwrap();
+        assert!(path.ends_with(&format!("-worktrees/{branch}")), "{path}");
+        assert!(wsl.exists(&path));
+        assert_eq!(wsl.git(&path, &["status", "--porcelain"]).unwrap().trim(), "");
+        assert_eq!(wsl.git(&path, &["branch", "--show-current"]).unwrap().trim(), branch);
+        assert_eq!(wsl.git(&repo, &["status", "--porcelain"]).unwrap(), status_before);
+        let again = create_worktree(&wsl, &repo, &branch).unwrap_err();
+        assert!(again.contains("already exists"), "{again}");
+        eprintln!("worktree created at {path}");
+    }
 }
