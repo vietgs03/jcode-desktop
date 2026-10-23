@@ -200,6 +200,10 @@ pub fn bind_workspace_keys(cx: &mut App) {
         // niri switch-preset-column-width / maximize-column.
         KeyBinding::new("super-r", CycleWidth, None),
         KeyBinding::new("super-f", MaximizeWidth, None),
+        // Windows reserves Win+R (Run) and Win+F (Feedback), so they never
+        // reach the app there. Ctrl+Alt aliases work on every platform.
+        KeyBinding::new("ctrl-alt-r", CycleWidth, None),
+        KeyBinding::new("ctrl-alt-f", MaximizeWidth, None),
         KeyBinding::new("super-1", WidthPreset1, None),
         KeyBinding::new("super-2", WidthPreset2, None),
         KeyBinding::new("super-3", WidthPreset3, None),

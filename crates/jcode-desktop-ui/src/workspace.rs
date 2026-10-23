@@ -9247,7 +9247,10 @@ fn compact_working_dir(path: &str) -> String {
 /// The first panel owns the viewport. Later panels use the normal column width
 /// so opening one reveals the scrolling layout rather than covering it.
 fn spawned_panel_width(existing_panels: usize) -> f32 {
-    if existing_panels == 0 {
+    // Windows has no tiling compositor to manage columns, so every chat opens
+    // at full width there. Panels still scroll side by side, and Ctrl+Alt+R or
+    // Ctrl+Alt+F narrows one again.
+    if existing_panels == 0 || cfg!(windows) {
         1.0
     } else {
         DEFAULT_WIDTH
