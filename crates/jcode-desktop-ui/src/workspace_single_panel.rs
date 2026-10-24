@@ -102,11 +102,17 @@ impl Workspace {
                 self.render_folder_picker(cx)
             } else {
                 // Retained, and rebuilt on its own inside the chrome: see
-                // `render_strip`.
-                div()
-                    .size_full()
-                    .child(slot.panel.clone())
-                    .into_any_element()
+                // `render_strip`. Coordinators keep the same Agents board in
+                // standalone windows, so viewing context never changes.
+                let session_id = slot.panel.read(cx).session_id.clone();
+                self.wrap_with_agents(
+                    &session_id,
+                    div()
+                        .size_full()
+                        .child(slot.panel.clone())
+                        .into_any_element(),
+                    cx,
+                )
             }
         });
         let back = self.active != 0;

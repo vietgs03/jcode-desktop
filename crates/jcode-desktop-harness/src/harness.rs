@@ -1859,8 +1859,9 @@ fn refresh_swarm_state(sessions: &mut [SessionInfo], updates: &UpdateSender) {
         return;
     }
     let host = wsl_history_host();
-    let roster = swarm_state::refresh(sessions, host.as_deref());
-    let _ = updates.send(Update::SwarmState { roster });
+    if let Some(roster) = swarm_state::refresh(sessions, host.as_deref()) {
+        let _ = updates.send(Update::SwarmState { roster });
+    }
 }
 
 fn wsl_history_host() -> Option<String> {

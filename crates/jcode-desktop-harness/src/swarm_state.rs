@@ -212,9 +212,9 @@ fn wsl_script() -> String {
 }
 
 /// Stream a WSL distribution's snapshots through one `wsl.exe` process.
-fn read_wsl(host: &str, roster: &mut Roster) {
+fn read_wsl(host: &str, roster: &mut Roster) -> bool {
     let Some(distro) = jcode_sdk::wsl_distro(host) else {
-        return;
+        return false;
     };
     let started = Instant::now();
     let mut command = std::process::Command::new("wsl.exe");
@@ -231,7 +231,7 @@ fn read_wsl(host: &str, roster: &mut Roster) {
     crate::platform::no_console_window(&mut command);
     let Ok(mut child) = command.spawn() else {
         eprintln!("jcode desktop: {host} swarm state: could not start wsl.exe");
-        return;
+        return false;
     };
     // Dropping stdin after the script closes it, so `sh -s` runs and exits.
     let script_written = child.stdin.take().is_some_and(|mut stdin| {
@@ -240,17 +240,20 @@ fn read_wsl(host: &str, roster: &mut Roster) {
     let Some(mut stdout) = child.stdout.take().filter(|_| script_written) else {
         let _ = child.kill();
         let _ = child.wait();
-        return;
+        return false;
     };
     let reader = std::thread::spawn(move || {
         let mut bytes = Vec::new();
-        let _ = std::io::Read::read_to_end(&mut stdout, &mut bytes);
-        bytes
+        std::io::Read::read_to_end(&mut stdout, &mut bytes).map(|_| bytes)
     });
     // A wedged distribution must not hold the session refresh forever.
     loop {
         match child.try_wait() {
-            Ok(Some(_)) => break,
+            Ok(Some(status)) if status.success() => break,
+            Ok(Some(status)) => {
+                eprintln!("jcode desktop: {host} swarm state exited with {status}");
+                return false;
+            }
             Ok(None) if started.elapsed() < WSL_READ_TIMEOUT => {
                 std::thread::sleep(Duration::from_millis(20));
             }
@@ -258,12 +261,12 @@ fn read_wsl(host: &str, roster: &mut Roster) {
                 let _ = child.kill();
                 let _ = child.wait();
                 eprintln!("jcode desktop: {host} swarm state timed out");
-                return;
+                return false;
             }
         }
     }
-    let Ok(bytes) = reader.join() else {
-        return;
+    let Ok(Ok(bytes)) = reader.join() else {
+        return false;
     };
     let before = roster.len();
     parse_stream(&bytes, Some(host), roster);
@@ -273,6 +276,7 @@ fn read_wsl(host: &str, roster: &mut Roster) {
         bytes.len(),
         roster.len() - before
     );
+    true
 }
 
 /// Fill missing ownership, labels and statuses on catalog sessions from the
@@ -296,17 +300,20 @@ pub fn enrich_sessions(sessions: &mut [SessionInfo], roster: &Roster) {
 }
 
 /// Collect this machine's roster plus the WSL history host's, then enrich
-/// the catalog so WSL agents nest under their WSL coordinator.
-pub fn refresh(sessions: &mut [SessionInfo], wsl_host: Option<&str>) -> Roster {
+/// the catalog so WSL agents nest under their WSL coordinator. If the WSL
+/// read fails, keep the last known UI roster instead of erasing it.
+pub fn refresh(sessions: &mut [SessionInfo], wsl_host: Option<&str>) -> Option<Roster> {
     let mut roster = Roster::new();
     if let Some(dir) = local_dir() {
         read_dir(&dir, &mut roster);
     }
-    if let Some(host) = wsl_host {
-        read_wsl(host, &mut roster);
+    if let Some(host) = wsl_host
+        && !read_wsl(host, &mut roster)
+    {
+        return None;
     }
     enrich_sessions(sessions, &roster);
-    roster
+    Some(roster)
 }
 
 #[cfg(test)]
@@ -454,7 +461,11 @@ mod tests {
         let dir = home.path().join("state/swarm");
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("a.json"), SNAPSHOT).unwrap();
-        std::fs::write(dir.join("b.json"), r#"{"updated_at_unix_ms": 5, "members": [{"session_id": "solo", "status": "ready"}]}"#).unwrap();
+        std::fs::write(
+            dir.join("b.json"),
+            r#"{"updated_at_unix_ms": 5, "members": [{"session_id": "solo", "status": "ready"}]}"#,
+        )
+        .unwrap();
         std::fs::write(dir.join("a.bak"), "not json").unwrap();
         let mut child = std::process::Command::new("sh")
             .arg("-s")

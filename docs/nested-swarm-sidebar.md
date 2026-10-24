@@ -12,7 +12,23 @@ Click an agent to open or focus its existing conversation. **Open lead** returns
 
 The CLI/TUI separates stable agent identity from changing activity. Its calm chat cards emphasize task labels, while the full swarm view exposes live output, recent tool intents, todos and runtime details. Keyboard controls cycle swarm views and navigate members. Relevant implementations are `jcode-tui-render/src/swarm_gallery.rs`, `jcode-tui/src/tui/info_widget_swarm_gallery.rs`, and `jcode-tui/src/tui/app/remote/swarm_status_core.rs` in the adjacent Jcode checkout.
 
-Desktop adopts the stable identity/status separation and safe inspect/detach interactions. Rich daemon `SwarmMemberStatus` data is not currently exposed as a typed swarm event through the harness SDK. This change does not invent live progress from persisted metadata or read daemon-only files as a Desktop-specific substitute. Conversation inspection continues to use the normal SDK watch path.
+Desktop adopts the stable identity/status separation and safe inspect/detach interactions. Rich daemon `SwarmMemberStatus` data is not exposed as a typed swarm event through the harness SDK, so the Agents board (below) reads the daemon's durable swarm snapshots. Conversation inspection continues to use the normal SDK watch path.
+
+## Agents board
+
+A session that owns swarm agents carries a calm strip at the top of its panel: `5 agents` followed by per-state counts with colored dots (`3 working · 1 done · 1 failed`). Clicking the strip unfolds the board: one row per agent with a status dot, the task label (bold), the friendly name (dim), the reported state, and how long ago the swarm last updated (or finished). A second line shows what the agent is doing now (its swarm `detail`, whitespace-collapsed and truncated). Finished agents show the first prose line of their latest completion report instead. Hover a row for the full activity, report and directory. Rows are ordered failed, blocked, working, starting, ready, then done and stopped. Clicking a row opens or focuses that agent's conversation through the same path as the sidebar (`Watch` once, reuse a mounted panel).
+
+The sidebar agents badge on a coordinator opens the coordinator with its board unfolded, and its tooltip lists every agent and its activity. An agent's own sidebar row replaces its directory/age line with `working · <activity>`.
+
+Implementation: `crates/jcode-desktop-ui/src/workspace_agents.rs` (model and rendering), `crates/jcode-desktop-harness/src/swarm_state.rs` (data).
+
+### WSL
+
+On Windows the SDK's local enrichment reads `%USERPROFILE%\.jcode`, so WSL sessions had no swarm data. After the WSL session list merge, the bridge streams the distribution's recent (30 days, under 4 MiB) `~/.jcode/state/swarm/*.json` through one `wsl.exe --exec sh -s` process (the fixed script is written to stdin, because Windows command-line quoting mangles nested quotes). Snapshots are separated by ASCII RS. Member and parent IDs are namespaced into `ssh://<host>/`, WSL catalog sessions are enriched with ownership, labels and statuses, and the combined local and WSL roster is sent as `Update::SwarmState`. A 10 second timeout protects the refresh. The `\\wsl.localhost` share is deliberately avoided.
+
+### Refresh
+
+The roster is refreshed with every session list refresh (the existing cadence) and the workspace requests a refresh when a `swarm`/`communicate` tool call finishes. There is no extra poll. An identical roster is not a visible change.
 
 ## Data
 

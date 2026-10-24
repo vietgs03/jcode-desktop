@@ -69,6 +69,32 @@ pub(super) fn groups(sessions: &[SessionInfo]) -> Groups {
     result
 }
 
+/// The details line for a swarm agent's sidebar row: lifecycle and what it is
+/// doing now, e.g. `working · Running e2e suite`. `None` for coordinators and
+/// ordinary sessions, which keep their directory/age details.
+pub(super) fn activity(
+    roster: &harness::swarm_state::Roster,
+    session_id: &str,
+) -> Option<String> {
+    let member = roster.get(session_id)?;
+    member.parent_session_id.as_ref()?;
+    let state = agents::AgentState::of(&member.status);
+    let status = if state == agents::AgentState::Other && !member.status.is_empty() {
+        member.status.clone()
+    } else {
+        state.label().to_owned()
+    };
+    let doing = member
+        .detail
+        .as_deref()
+        .map(|detail| detail.split_whitespace().collect::<Vec<_>>().join(" "))
+        .filter(|detail| !detail.is_empty());
+    Some(match doing {
+        Some(doing) => format!("{status} · {doing}"),
+        None => status,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

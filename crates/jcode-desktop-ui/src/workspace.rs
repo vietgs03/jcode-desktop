@@ -64,6 +64,8 @@ mod sidebar_projects;
 mod sidebar_selection;
 #[path = "sidebar_swarm.rs"]
 mod sidebar_swarm;
+#[path = "workspace_agents.rs"]
+mod agents;
 #[path = "sidebar_worktrees.rs"]
 mod sidebar_worktrees;
 #[path = "workspace_stream_fixture.rs"]
@@ -814,6 +816,10 @@ pub struct Workspace {
     /// streaming markers, with the sidebar mark shown while no panel is open.
     /// Marks persist across polls so the orb animates instead of restarting.
     daemon_running: HashMap<String, gpui::AnyView>,
+    /// Swarm members (local and WSL) by Desktop session ID, from the bridge.
+    swarm_roster: harness::swarm_state::Roster,
+    /// Coordinators whose Agents board is unfolded.
+    agents_expanded: HashSet<String>,
     /// Never rerank an established shortcut, including after session refreshes.
     pinned_working_dir: Option<String>,
     /// Configured logins and API keys, refreshed in the background.
@@ -1132,6 +1138,8 @@ impl Workspace {
             coach_display_hint: None,
             sessions: Vec::new(),
             daemon_running: HashMap::new(),
+            swarm_roster: Default::default(),
+            agents_expanded: HashSet::new(),
             pinned_working_dir: crate::config::get().workspace.pinned_working_dir.clone(),
             remotes: remotes::Machines::from_config(),
             accounts: Vec::new(),
@@ -1517,6 +1525,8 @@ impl Workspace {
             coach_display_hint: None,
             sessions: Vec::new(),
             daemon_running: HashMap::new(),
+            swarm_roster: Default::default(),
+            agents_expanded: HashSet::new(),
             pinned_working_dir: None,
             remotes: remotes::Machines::default(),
             accounts: Vec::new(),
@@ -2331,7 +2341,7 @@ impl Workspace {
                     return crate::applet_runtime::get(cx).sync_agent(&session_id, snapshot);
                 }
                 self.forward_tool_call(&session_id, &event, cx);
-                if sidebar_edits::refresh_after(&event) {
+                if sidebar_edits::refresh_after(&event) || agents::refresh_after(&event) {
                     self.bridge.send(Command::RefreshSessions);
                 }
                 if let Some(session) = self
@@ -2396,6 +2406,12 @@ impl Workspace {
                 }
             }
             Update::MessageSubmitted { .. } => {}
+            Update::SwarmState { roster } => {
+                if roster == self.swarm_roster {
+                    return false;
+                }
+                self.swarm_roster = roster;
+            }
             Update::SessionSaved {
                 session_id,
                 saved,
@@ -4674,10 +4690,16 @@ impl Workspace {
                     // the panel changed, the workspace around it is drawn from
                     // the last frame with the panel built again in its place.
                     // A `.cached` view would opt out of the latter.
-                    div()
-                        .size_full()
-                        .child(slot.panel.clone())
-                        .into_any_element()
+                    // A coordinator carries its Agents strip above the chat.
+                    let session_id = slot.panel.read(cx).session_id.clone();
+                    self.wrap_with_agents(
+                        &session_id,
+                        div()
+                            .size_full()
+                            .child(slot.panel.clone())
+                            .into_any_element(),
+                        cx,
+                    )
                 });
             if focused {
                 active_surface = Some(surface);
@@ -5989,6 +6011,17 @@ impl Workspace {
 
                             let group_selected = is_open && this.sidebar_selection.contains(&session.session_id);
                             let (agent_total, agent_working) = row.agents;
+                            let agents_board_id = session.session_id.clone();
+                            let agents_tooltip = if agent_total > 0 {
+                                format!("{}\nClick to open the agent board.", this.agents_board(&session.session_id).tooltip())
+                            } else {
+                                String::new()
+                            };
+                            // A swarm agent's row says what it is doing now.
+                            let details = match sidebar_swarm::activity(&this.swarm_roster, &session.session_id) {
+                                Some(activity) => Some(activity),
+                                None => details,
+                            };
                             let under_checkout = checkout_rows[row.project];
                             let close_id = session.session_id.clone();
                             let pin_id = session.session_id.clone();
@@ -6128,6 +6161,16 @@ impl Workspace {
                                                 div()
                                                     .id(("sidebar-agents", sidebar_index))
                                                     .debug_selector(move || format!("sidebar-agents-{sidebar_index}"))
+                                                    .cursor_pointer()
+                                                    .on_mouse_down(gpui::MouseButton::Left, |_, window, cx| {
+                                                        window.prevent_default();
+                                                        cx.stop_propagation();
+                                                    })
+                                                    .on_mouse_up(gpui::MouseButton::Left, cx.listener(move |this, _, window, cx| {
+                                                        cx.stop_propagation();
+                                                        this.sidebar_gesture = None;
+                                                        this.open_agents_board(&agents_board_id, window, cx);
+                                                    }))
                                                     .flex_none()
                                                     .h(px(16.0))
                                                     .px(px(6.0))
@@ -6138,11 +6181,7 @@ impl Workspace {
                                                     .bg(if agent_working > 0 { Theme::global().ACCENT_DIM } else { Theme::global().TOOL_BG })
                                                     .text_size(px(9.0))
                                                     .text_color(Theme::global().TEXT_DIM)
-                                                    .tooltip(move |_, cx| cx.new(|_| remotes::HeaderTooltip(format!(
-                                                        "{agent_total} swarm agent{} in this checkout{}",
-                                                        if agent_total == 1 { "" } else { "s" },
-                                                        if agent_working > 0 { format!(", {agent_working} working") } else { String::new() },
-                                                    ).into())).into())
+                                                    .tooltip(move |_, cx| cx.new(|_| agents::AgentTooltip(agents_tooltip.clone())).into())
                                                     .child(gpui::svg().data(include_bytes!("../../../assets/icons/swarm.svg").as_slice()).size(px(9.0)).text_color(Theme::global().TEXT_DIM))
                                                     .child(agent_total.to_string()),
                                             ))
