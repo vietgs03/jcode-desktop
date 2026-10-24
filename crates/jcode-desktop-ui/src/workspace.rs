@@ -68,6 +68,8 @@ mod sidebar_swarm;
 mod agents;
 #[path = "sidebar_worktrees.rs"]
 mod sidebar_worktrees;
+#[path = "workspace_terminal.rs"]
+mod workspace_terminal;
 #[path = "workspace_stream_fixture.rs"]
 mod workspace_stream_fixture;
 
@@ -3290,9 +3292,10 @@ impl Workspace {
 
     fn new_terminal(&mut self, _: &NewTerminal, window: &mut Window, cx: &mut Context<Self>) {
         let width_fraction = spawned_panel_width(self.slots.len());
+        let working_dir = self.new_terminal_working_dir(cx);
         let panel = cx.new(|cx| {
             Panel::new_terminal(
-                self.default_working_dir(),
+                working_dir,
                 self.bridge.clone(),
                 self.host,
                 None,
@@ -5730,7 +5733,7 @@ impl Workspace {
             .zip(&checkout_rows)
             .map(|(checkouts, rows)| {
                 (!rows)
-                    .then(|| checkouts.first().map(|c| c.branch.clone()))
+                    .then(|| checkouts.first().map(|c| (c.branch.clone(), c.dirty)))
                     .flatten()
             })
             .collect::<Vec<_>>();
@@ -5743,6 +5746,8 @@ impl Workspace {
             active_id.as_deref(),
             active_project.map(|index| groups[index].0.key.as_str()),
         );
+        // Branch, dirty and WSL checkouts asked for above load in the background.
+        self.schedule_checkout_probes(cx);
         let headers = groups.len() > 1
             || groups
                 .first()

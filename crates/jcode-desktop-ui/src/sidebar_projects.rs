@@ -2,6 +2,7 @@
 //! spawned in, or its working directory outside Git. Grouping is presentation
 //! only. It never closes, moves, or reorders panels.
 use super::*;
+use jcode_desktop_harness::session_git::{self, CheckoutInfo, Location};
 
 #[path = "sidebar_project_dock.rs"]
 mod dock;
@@ -24,11 +25,30 @@ pub(super) struct Checkout {
     pub path: String,
     pub branch: String,
     pub linked: bool,
+    /// Uncommitted changes. Known only after the background Git probe.
+    pub dirty: bool,
+    /// The WSL distribution this checkout lives in, `None` when local.
+    pub wsl: Option<Location>,
 }
 
 /// Branches move underneath us (checkout, rebase), so HEAD is re-read after
 /// this interval rather than on every hover repaint.
 const CHECKOUT_TTL: Duration = Duration::from_secs(3);
+/// Git probes spawn processes (wsl.exe for WSL), so they refresh less often
+/// and always off the UI thread.
+const PROBE_TTL: Duration = Duration::from_secs(10);
+
+type ProbeKey = (Location, String);
+
+/// The WSL machine a session runs on, including a pending WSL draft, so a
+/// new worktree chat joins its project before the daemon replies.
+pub(super) fn session_wsl(session_id: &str) -> Option<(String, Location)> {
+    let host = harness::remote_host(session_id).or_else(|| {
+        pending::remote_draft_host(session_id).map(str::to_owned)
+    })?;
+    let distro = jcode_sdk::wsl_distro(&host)?.map(str::to_owned);
+    Some((host, Location::Wsl(distro)))
+}
 
 #[derive(Default)]
 pub(super) struct State {
@@ -39,6 +59,13 @@ pub(super) struct State {
     /// directory, never on every hover repaint.
     roots: HashMap<String, Option<PathBuf>>,
     checkouts: HashMap<String, (Option<Checkout>, Instant)>,
+    /// Background Git results: WSL session directories, and local checkout
+    /// roots (for their dirty state).
+    probes: HashMap<ProbeKey, (Option<CheckoutInfo>, Instant)>,
+    wanted: HashSet<ProbeKey>,
+    probing: Option<gpui::Task<()>>,
+    /// WSL repository projects by key, for their header actions.
+    wsl_projects: HashMap<String, (Location, String)>,
 }
 
 impl State {
@@ -63,25 +90,74 @@ impl State {
         }
     }
 
-    /// The local checkout a session runs in. Remote sessions never probe local Git.
-    pub(super) fn checkout(&mut self, session: &jcode_sdk::SessionInfo) -> Option<Checkout> {
-        if harness::remote_host(&session.session_id).is_some() {
-            return None;
+    /// The last background result for a directory, queueing a refresh when it
+    /// is missing or stale. `None` until the first probe finishes.
+    fn probe(&mut self, location: &Location, directory: &str) -> Option<Option<CheckoutInfo>> {
+        let key = (location.clone(), directory.to_owned());
+        let cached = self.probes.get(&key);
+        if cached.is_none_or(|(_, read)| read.elapsed() >= PROBE_TTL) {
+            self.wanted.insert(key);
         }
+        cached.map(|(value, _)| value.clone())
+    }
+
+    /// The checkout a session runs in. Local checkouts read `.git` directly;
+    /// WSL checkouts come from the background probe. Other SSH hosts have none.
+    pub(super) fn checkout(&mut self, session: &jcode_sdk::SessionInfo) -> Option<Checkout> {
         let directory = session
             .working_dir
             .as_deref()
             .map(str::trim)
             .filter(|d| !d.is_empty())?;
-        if let Some((cached, read)) = self.checkouts.get(directory)
-            && read.elapsed() < CHECKOUT_TTL
-        {
-            return cached.clone();
+        if let Some((_, location)) = session_wsl(&session.session_id) {
+            let info = self.probe(&location, directory)??;
+            return Some(Checkout {
+                path: info.path,
+                branch: info.branch,
+                linked: info.linked,
+                dirty: info.dirty,
+                wsl: Some(location),
+            });
         }
-        let value = probe_checkout(Path::new(directory));
-        self.checkouts
-            .insert(directory.to_owned(), (value.clone(), Instant::now()));
+        if harness::remote_host(&session.session_id).is_some() {
+            return None;
+        }
+        let mut value = match self.checkouts.get(directory) {
+            Some((cached, read)) if read.elapsed() < CHECKOUT_TTL => cached.clone(),
+            _ => {
+                let value = probe_checkout(Path::new(directory));
+                self.checkouts
+                    .insert(directory.to_owned(), (value.clone(), Instant::now()));
+                value
+            }
+        };
+        if let Some(checkout) = &mut value {
+            checkout.dirty = self
+                .probe(&Location::Local, &checkout.path.clone())
+                .flatten()
+                .is_some_and(|info| info.dirty);
+        }
         value
+    }
+
+    /// The WSL repository behind a project header, if it is one.
+    pub(super) fn wsl_project(&self, key: &str) -> Option<&(Location, String)> {
+        self.wsl_projects.get(key)
+    }
+
+    /// Directories whose probe is due, grouped per machine.
+    fn take_due(&mut self) -> HashMap<Location, Vec<String>> {
+        let mut due: HashMap<Location, Vec<String>> = HashMap::new();
+        for key in std::mem::take(&mut self.wanted) {
+            let fresh = self
+                .probes
+                .get(&key)
+                .is_some_and(|(_, read)| read.elapsed() < PROBE_TTL);
+            if !fresh {
+                due.entry(key.0).or_default().push(key.1);
+            }
+        }
+        due
     }
 
     fn root(&mut self, directory: &str) -> Option<PathBuf> {
@@ -101,6 +177,32 @@ impl State {
             .as_deref()
             .map(str::trim)
             .filter(|dir| !dir.is_empty());
+        if let Some((host, location)) = session_wsl(&session.session_id)
+            && let Some(directory) = directory
+            && let Some(Some(info)) = self.probe(&location, directory)
+        {
+            // Every worktree of one WSL repository shares its project.
+            let key = format!("ssh://{host}{}", info.main);
+            let subdirectory = if info.linked {
+                sidebar_session_directory(session)
+            } else {
+                directory
+                    .strip_prefix(info.main.as_str())
+                    .map(|rest| rest.trim_start_matches('/'))
+                    .filter(|rest| !rest.is_empty())
+                    .map(str::to_owned)
+            };
+            self.wsl_projects
+                .insert(key.clone(), (location, info.main.clone()));
+            return (
+                Project {
+                    label: format!("{host} · {}", path_label(&info.main)),
+                    location: Some(format!("{host} · {}", info.main)),
+                    key,
+                },
+                subdirectory,
+            );
+        }
         if let Some(host) = harness::remote_host(&session.session_id) {
             let label = match directory {
                 Some(dir) => format!("{host} · {}", path_label(dir)),
@@ -204,6 +306,8 @@ pub(super) fn probe_checkout(directory: &Path) -> Option<Checkout> {
             path: ancestor.to_string_lossy().into_owned(),
             branch,
             linked,
+            dirty: false,
+            wsl: None,
         });
     }
     None
@@ -215,11 +319,72 @@ fn linked_worktree_main(worktree: &Path, marker: &Path) -> Option<PathBuf> {
     let gitdir = worktree.join(gitdir);
     // Submodules have no commondir and remain their own project.
     let common = std::fs::read_to_string(gitdir.join("commondir")).ok()?;
-    let common = std::fs::canonicalize(gitdir.join(common.trim())).ok()?;
+    let common = plain_canonical(&gitdir.join(common.trim()))?;
     (common.file_name()? == ".git").then(|| common.parent().map(Path::to_path_buf))?
 }
 
+/// `canonicalize`, minus the `\\?\` verbatim prefix Windows adds. Session
+/// directories are plain paths, so a verbatim root would never match them as
+/// a project key or a `strip_prefix` base.
+pub(super) fn plain_canonical(path: &Path) -> Option<PathBuf> {
+    let path = std::fs::canonicalize(path).ok()?;
+    if let Some(plain) = path.to_str().and_then(|text| text.strip_prefix(r"\\?\"))
+        && !plain.starts_with(r"UNC\")
+    {
+        return Some(PathBuf::from(plain));
+    }
+    Some(path)
+}
+
 impl Workspace {
+    /// Start one background Git probe for every directory the last render
+    /// asked about. Results land in the cache and repaint the sidebar; the UI
+    /// thread never waits on Git or wsl.exe.
+    pub(super) fn schedule_checkout_probes(&mut self, cx: &mut Context<Self>) {
+        if self.sidebar_projects.probing.is_some() {
+            return;
+        }
+        let due = self.sidebar_projects.take_due();
+        if due.is_empty() {
+            return;
+        }
+        let task = cx.background_executor().spawn(async move {
+            let mut results = Vec::new();
+            for (location, directories) in due {
+                let infos = session_git::checkout_infos(&location, &directories);
+                for (directory, info) in directories.into_iter().zip(infos) {
+                    results.push(((location.clone(), directory), info));
+                }
+            }
+            results
+        });
+        self.sidebar_projects.probing = Some(cx.spawn(async move |this, cx| {
+            let results = task.await;
+            let _ = this.update(cx, |this, cx| {
+                let now = Instant::now();
+                for (key, info) in results {
+                    this.sidebar_projects.probes.insert(key, (info, now));
+                }
+                this.sidebar_projects.probing = None;
+                cx.notify();
+            });
+        }));
+    }
+
+    /// Open a new chat in `directory` on the machine that owns it.
+    pub(super) fn open_thread_at(
+        &mut self,
+        location: Option<&Location>,
+        directory: String,
+        cx: &mut Context<Self>,
+    ) {
+        self.focus_pending = true;
+        match location {
+            Some(location) => self.open_session_in(location, directory, "New session".into(), cx),
+            None => self.open_local_draft(Some(directory), cx),
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(super) fn render_project_header(
         &self,
@@ -227,7 +392,7 @@ impl Workspace {
         project: &Project,
         count: usize,
         collapsed: bool,
-        branch: Option<String>,
+        branch: Option<(String, bool)>,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
         let theme = Theme::global();
@@ -239,13 +404,20 @@ impl Workspace {
             if count == 1 { "" } else { "s" },
         );
         let key = project.key.clone();
-        // Only local directories can host a new thread or worktree from here.
+        // Local directories and probed WSL repositories can host a new thread
+        // or worktree from here. Other SSH hosts cannot.
+        let wsl = self.sidebar_projects.wsl_project(&project.key).cloned();
         let local = Path::new(&project.key)
             .is_absolute()
             .then(|| project.key.clone());
-        let git = local
-            .as_deref()
-            .is_some_and(|dir| Path::new(dir).join(".git").exists());
+        let git = wsl.is_some()
+            || local
+                .as_deref()
+                .is_some_and(|dir| Path::new(dir).join(".git").exists());
+        let thread_target = match &wsl {
+            Some((location, main)) => Some((Some(location.clone()), main.clone())),
+            None => local.clone().map(|dir| (None, dir)),
+        };
         let group: &'static str = "sidebar-project-header";
         div()
             .id(("sidebar-project", index))
@@ -295,7 +467,7 @@ impl Workspace {
                     .text_color(theme.TEXT_DIM)
                     .child(project.label.clone()),
             )
-            .children(branch.map(|branch| {
+            .children(branch.map(|(branch, dirty)| {
                 div()
                     .debug_selector(move || format!("sidebar-project-branch-{index}"))
                     .flex_shrink(1.0)
@@ -311,6 +483,9 @@ impl Workspace {
                     .text_color(theme.TEXT_DIM)
                     .child(sidebar_worktrees::icon(sidebar_worktrees::BRANCH_ICON, 9.0))
                     .child(div().min_w_0().truncate().child(branch))
+                    .when(dirty, |el| {
+                        el.child(dirty_marker(format!("sidebar-project-dirty-{index}")))
+                    })
             }))
             .child(div().flex_1())
             .child(
@@ -323,10 +498,10 @@ impl Workspace {
                     .child(count.to_string()),
             )
             // Actions overlay the row end on hover instead of reserving width.
-            .when(git || local.is_some(), |el| {
+            .when(git || thread_target.is_some(), |el| {
                 let mut actions = sidebar_worktrees::hover_actions(group, 24.0);
-                if git {
-                    let directory = local.clone().unwrap_or_default();
+                if git && let Some((location, directory)) = thread_target.clone() {
+                    let location = location.unwrap_or(Location::Local);
                     actions = actions.child(
                         sidebar_worktrees::header_action(
                             format!("sidebar-project-worktree-{index}").into(),
@@ -340,12 +515,12 @@ impl Workspace {
                             cx.listener(move |this, _, window, cx| {
                                 window.prevent_default();
                                 cx.stop_propagation();
-                                this.begin_worktree(directory.clone(), window, cx);
+                                this.begin_worktree(location.clone(), directory.clone(), window, cx);
                             }),
                         ),
                     );
                 }
-                if let Some(directory) = local.clone() {
+                if let Some((location, directory)) = thread_target.clone() {
                     let key = project.key.clone();
                     actions = actions.child(
                         sidebar_worktrees::header_action(
@@ -361,8 +536,7 @@ impl Workspace {
                                 window.prevent_default();
                                 cx.stop_propagation();
                                 this.sidebar_projects.collapsed.insert(key.clone(), false);
-                                this.focus_pending = true;
-                                this.open_local_draft(Some(directory.clone()), cx);
+                                this.open_thread_at(location.as_ref(), directory.clone(), cx);
                             }),
                         ),
                     );
@@ -385,18 +559,27 @@ impl Workspace {
             Some(checkout) => (
                 checkout.branch.clone(),
                 format!(
-                    "{} · {}",
+                    "{}{} · {}",
                     if checkout.linked {
                         "Worktree"
                     } else {
                         "Main checkout"
                     },
-                    compact_working_dir(&checkout.path)
+                    if checkout.dirty { " with uncommitted changes" } else { "" },
+                    match &checkout.wsl {
+                        Some(location) => format!(
+                            "{} · {}",
+                            location.host().unwrap_or_default(),
+                            checkout.path
+                        ),
+                        None => compact_working_dir(&checkout.path),
+                    }
                 ),
             ),
             None => ("Outside Git".into(), "Threads outside any checkout".into()),
         };
-        let path = checkout.map(|checkout| checkout.path.clone());
+        let path = checkout.map(|checkout| (checkout.wsl.clone(), checkout.path.clone()));
+        let dirty = checkout.is_some_and(|c| c.dirty);
         div()
             .id(("sidebar-checkout", index))
             .debug_selector(move || format!("sidebar-checkout-{index}"))
@@ -434,6 +617,9 @@ impl Workspace {
                     .debug_selector(move || format!("sidebar-checkout-label-{index}"))
                     .child(label),
             )
+            .when(dirty, |el| {
+                el.child(dirty_marker(format!("sidebar-checkout-dirty-{index}")))
+            })
             .when(checkout.is_some_and(|c| c.linked), |el| {
                 el.child(
                     div()
@@ -445,7 +631,7 @@ impl Workspace {
                         .child("worktree"),
                 )
             })
-            .when_some(path, |el, path| {
+            .when_some(path, |el, (location, path)| {
                 el.child(
                     sidebar_worktrees::hover_actions(group, 4.0).child(
                         sidebar_worktrees::header_action(
@@ -460,8 +646,7 @@ impl Workspace {
                             cx.listener(move |this, _, window, cx| {
                                 window.prevent_default();
                                 cx.stop_propagation();
-                                this.focus_pending = true;
-                                this.open_local_draft(Some(path.clone()), cx);
+                                this.open_thread_at(location.as_ref(), path.clone(), cx);
                             }),
                         ),
                     ),
@@ -471,6 +656,17 @@ impl Workspace {
     }
 }
 
+/// A small dot after a branch name: the checkout has uncommitted changes.
+fn dirty_marker(selector: String) -> gpui::AnyElement {
+    div()
+        .debug_selector(move || selector.clone())
+        .flex_none()
+        .size(px(5.0))
+        .rounded_full()
+        .bg(Theme::global().ACCENT)
+        .into_any_element()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -478,7 +674,7 @@ mod tests {
     #[test]
     fn repositories_group_subdirectories_and_linked_worktrees() {
         let temp = tempfile::tempdir().unwrap();
-        let repo = std::fs::canonicalize(temp.path()).unwrap().join("repo");
+        let repo = plain_canonical(temp.path()).unwrap().join("repo");
         std::fs::create_dir_all(repo.join(".git/worktrees/feature")).unwrap();
         std::fs::create_dir_all(repo.join("crates/ui")).unwrap();
         let feature = repo.parent().unwrap().join("feature");
@@ -506,13 +702,14 @@ mod tests {
             state.project(&info)
         };
         let (root, none) = session("a", &repo);
-        let (nested, sub) = session("b", &repo.join("crates/ui"));
+        let (nested, sub) = session("b", &repo.join("crates").join("ui"));
         let (linked, _) = session("c", &feature);
         let (notes, _) = session("d", &plain);
         assert_eq!(root.label, "repo");
         assert_eq!(none, None);
         assert_eq!(nested.key, root.key);
-        assert_eq!(sub.as_deref(), Some("crates/ui"));
+        let expected = Path::new("crates").join("ui");
+        assert_eq!(sub.as_deref(), expected.to_str());
         assert_eq!(linked.key, root.key);
         assert_eq!(notes.label, "notes");
         assert_ne!(notes.key, root.key);

@@ -295,6 +295,11 @@ fn wsl_changes_and_worktree_commands_end_to_end(cx: &mut gpui::TestAppContext) {
         }
     };
     let (host, dir) = created.expect("/wt requested a WSL session");
+    let _cleanup = crate::workspace::sidebar_worktrees::WslWorktreeCleanup {
+        repo: repo.clone(),
+        path: dir.clone(),
+        branch: branch.clone(),
+    };
     assert_eq!(host, "wsl");
     let dir = dir.expect("worktree directory");
     assert!(dir.ends_with(&format!("-worktrees/{branch}")), "{dir}");

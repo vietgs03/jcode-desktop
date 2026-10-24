@@ -870,6 +870,128 @@ fn split_path(path: &str) -> Option<(&str, &str)> {
     (!name.is_empty()).then_some((if parent.is_empty() { "/" } else { parent }, name))
 }
 
+/// The checkout a directory belongs to, as Git reports it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CheckoutInfo {
+    /// Top level of this checkout (main working tree or linked worktree).
+    pub path: String,
+    /// The repository's main working tree, shared by all its worktrees.
+    pub main: String,
+    /// Branch name, or `detached <short sha>`.
+    pub branch: String,
+    /// A linked worktree rather than the main working tree.
+    pub linked: bool,
+    /// Uncommitted changes, including untracked files.
+    pub dirty: bool,
+}
+
+/// Probe the checkout containing `directory`. `Ok(None)` outside Git. This
+/// spawns Git (through wsl.exe for WSL), so call it off the UI thread.
+pub fn checkout_info(location: &Location, directory: &str) -> Result<Option<CheckoutInfo>, String> {
+    let paths = match location.git(
+        directory,
+        &["rev-parse", "--path-format=absolute", "--show-toplevel", "--git-dir", "--git-common-dir"],
+    ) {
+        Ok(paths) => paths,
+        Err(error) if error.contains("not a git repository") => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    let mut lines = paths.lines().map(str::trim);
+    let (Some(path), Some(git_dir), Some(common)) = (lines.next(), lines.next(), lines.next())
+    else {
+        // Bare repositories and `.git` directories have no top level.
+        return Ok(None);
+    };
+    let status = location.git(directory, &["status", "--porcelain=v2", "--branch"])?;
+    Ok(Some(parse_checkout(path, git_dir, common, &status)))
+}
+
+fn trim(path: &str) -> String {
+    path.trim_end_matches(['/', '\\']).to_owned()
+}
+
+/// Separates directories (RS) and rev-parse from status (US) in batch output.
+const RECORD: char = '\u{1e}';
+const UNIT: char = '\u{1f}';
+
+/// Prints `RS <rev-parse> US <status>` per argument, or a bare RS outside Git.
+const BATCH_SCRIPT: &str = "export GIT_OPTIONAL_LOCKS=0; for d do printf '\\036'; \
+    if p=$(cd -- \"$d\" 2>/dev/null && git rev-parse --path-format=absolute --show-toplevel --git-dir --git-common-dir 2>/dev/null); then \
+    printf '%s\\n\\037' \"$p\"; \
+    (cd -- \"$d\" && git --no-pager -c color.ui=false -c core.fsmonitor=false status --porcelain=v2 --branch 2>/dev/null); \
+    fi; done";
+
+/// Probe many directories with a single process where that matters: each
+/// wsl.exe launch costs far more than the Git calls themselves. Directories
+/// are passed as positional arguments to a constant script, never spliced
+/// into it. Results keep the input order. Call off the UI thread.
+pub fn checkout_infos(location: &Location, directories: &[String]) -> Vec<Option<CheckoutInfo>> {
+    if directories.is_empty() {
+        return Vec::new();
+    }
+    if *location == Location::Local {
+        return directories
+            .iter()
+            .map(|dir| checkout_info(location, dir).ok().flatten())
+            .collect();
+    }
+    let mut command = location.command("/", "sh");
+    command.arg("-c").arg(BATCH_SCRIPT).arg("sh").args(directories);
+    let Ok(output) = location.output(&mut command) else {
+        return vec![None; directories.len()];
+    };
+    let mut results = parse_batch(&String::from_utf8_lossy(&output.stdout));
+    results.resize(directories.len(), None);
+    results
+}
+
+fn parse_batch(stdout: &str) -> Vec<Option<CheckoutInfo>> {
+    stdout
+        .split(RECORD)
+        .skip(1)
+        .map(|record| {
+            let (paths, status) = record.split_once(UNIT)?;
+            let mut lines = paths.lines().map(str::trim);
+            let (path, git_dir, common) = (lines.next()?, lines.next()?, lines.next()?);
+            Some(parse_checkout(path, git_dir, common, status))
+        })
+        .collect()
+}
+
+fn parse_checkout(path: &str, git_dir: &str, common: &str, status: &str) -> CheckoutInfo {
+    let (git_dir, common) = (trim(git_dir), trim(common));
+    let main = split_path(&common)
+        .filter(|(_, name)| *name == ".git")
+        .map(|(parent, _)| parent.to_owned())
+        .unwrap_or_else(|| trim(path));
+    let mut head = None;
+    let mut oid = None;
+    let mut dirty = false;
+    for line in status.lines() {
+        if let Some(value) = line.strip_prefix("# branch.head ") {
+            head = Some(value.trim());
+        } else if let Some(value) = line.strip_prefix("# branch.oid ") {
+            oid = Some(value.trim());
+        } else if !line.starts_with('#') && !line.trim().is_empty() {
+            dirty = true;
+        }
+    }
+    let branch = match head {
+        Some("(detached)") | None => format!(
+            "detached {}",
+            oid.unwrap_or_default().chars().take(8).collect::<String>()
+        ),
+        Some(name) => name.to_owned(),
+    };
+    CheckoutInfo {
+        path: trim(path),
+        main,
+        branch,
+        linked: git_dir != common,
+        dirty,
+    }
+}
+
 /// Create a new branch from HEAD in its own checkout beside the repository,
 /// at `<repo>-worktrees/<encoded-branch>`, and return its path. The original
 /// checkout, including uncommitted work, is never modified. Nothing is forced,
@@ -917,6 +1039,120 @@ mod tests {
     }
 
     #[test]
+    fn checkout_status_parses_branch_worktree_and_dirty() {
+        let main = parse_checkout(
+            "/home/me/repo",
+            "/home/me/repo/.git",
+            "/home/me/repo/.git",
+            "# branch.oid 0123456789abcdef\n# branch.head main\n1 .M N... 100644 100644 100644 a b x.rs\n",
+        );
+        assert_eq!(
+            main,
+            CheckoutInfo {
+                path: "/home/me/repo".into(),
+                main: "/home/me/repo".into(),
+                branch: "main".into(),
+                linked: false,
+                dirty: true,
+            }
+        );
+        let linked = parse_checkout(
+            "/home/me/repo-worktrees/feature%2Fx",
+            "/home/me/repo/.git/worktrees/feature%2Fx",
+            "/home/me/repo/.git",
+            "# branch.oid 0123456789abcdef\n# branch.head (detached)\n",
+        );
+        assert_eq!(linked.main, "/home/me/repo");
+        assert_eq!(linked.branch, "detached 01234567");
+        assert!(linked.linked);
+        assert!(!linked.dirty);
+    }
+
+    #[test]
+    fn local_checkout_info_reads_a_real_repository() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = std::fs::canonicalize(temp.path()).unwrap().join("repo");
+        std::fs::create_dir_all(repo.join("src")).unwrap();
+        let dir = repo.to_string_lossy().into_owned();
+        assert_eq!(checkout_info(&Location::Local, &dir), Ok(None));
+        let git = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .current_dir(&repo)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(status.status.success(), "{}", String::from_utf8_lossy(&status.stderr));
+        };
+        git(&["init", "-b", "trunk"]);
+        git(&["config", "user.name", "Fixture"]);
+        git(&["config", "user.email", "fixture@example.invalid"]);
+        std::fs::write(repo.join("src/a"), "a").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-m", "init"]);
+        let sub = repo.join("src").to_string_lossy().into_owned();
+        let clean = checkout_info(&Location::Local, &sub).unwrap().unwrap();
+        assert_eq!(clean.branch, "trunk");
+        assert!(!clean.dirty && !clean.linked);
+        assert_eq!(
+            std::fs::canonicalize(&clean.path).unwrap(),
+            std::fs::canonicalize(&repo).unwrap()
+        );
+        assert_eq!(clean.path, clean.main);
+        std::fs::write(repo.join("new"), "untracked").unwrap();
+        assert!(checkout_info(&Location::Local, &dir).unwrap().unwrap().dirty);
+
+        // The WSL batch script is plain POSIX sh; run it here too.
+        #[cfg(unix)]
+        {
+            let worktree = repo.parent().unwrap().join("repo-wt");
+            let wt = worktree.to_string_lossy().into_owned();
+            git(&["worktree", "add", "-b", "side", "--", &wt, "HEAD"]);
+            let dirs = vec![
+                sub.clone(),
+                "/definitely/missing; echo pwned".to_owned(),
+                wt.clone(),
+                "/".to_owned(),
+            ];
+            let output = std::process::Command::new("sh")
+                .arg("-c")
+                .arg(BATCH_SCRIPT)
+                .arg("sh")
+                .args(&dirs)
+                .output()
+                .unwrap();
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(!stdout.contains("pwned"));
+            let batch = parse_batch(&stdout);
+            assert_eq!(batch.len(), 4);
+            let first = batch[0].clone().unwrap();
+            assert!(first.dirty && !first.linked);
+            assert_eq!(first.branch, "trunk");
+            assert_eq!(batch[1], None);
+            let side = batch[2].clone().unwrap();
+            assert_eq!(side.branch, "side");
+            assert!(side.linked && !side.dirty);
+            assert_eq!(side.main, first.path);
+            assert_eq!(batch[3], None);
+        }
+    }
+
+    /// Windows only, opt-in like the test below. Read-only.
+    #[test]
+    fn wsl_checkout_info_reports_the_session_repository() {
+        let Ok(repo) = std::env::var("JCODE_WSL_TEST_REPO") else {
+            return;
+        };
+        let info = checkout_info(&Location::Wsl(None), &repo).unwrap().expect("a repo");
+        assert_eq!(info.path, repo);
+        assert_eq!(info.main, repo);
+        assert!(!info.linked);
+        assert!(!info.branch.is_empty());
+        assert_eq!(checkout_info(&Location::Wsl(None), "/"), Ok(None));
+        let batch = checkout_infos(&Location::Wsl(None), &[repo.clone(), "/".into()]);
+        assert_eq!(batch, vec![Some(info), None]);
+    }
+
+    #[test]
     fn local_sessions_resolve_locally() {
         assert_eq!(Location::of_session("session_abc"), Some(Location::Local));
         assert_eq!(Location::Local.host(), None);
@@ -948,5 +1184,7 @@ mod tests {
         let again = create_worktree(&wsl, &repo, &branch).unwrap_err();
         assert!(again.contains("already exists"), "{again}");
         eprintln!("worktree created at {path}");
+        wsl.git(&repo, &["worktree", "remove", "--", &path]).unwrap();
+        wsl.git(&repo, &["branch", "-d", "--", &branch]).unwrap();
     }
 }

@@ -3,6 +3,7 @@
 //! swarm agents) running in it, share one hierarchy of
 //! project, then branch or worktree, then threads.
 use super::*;
+use jcode_desktop_harness::session_git::{self, Location};
 
 pub(super) const BRANCH_ICON: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><g fill="none" stroke="black" stroke-width="1.6"><circle cx="6" cy="5" r="2.5"/><circle cx="18" cy="5" r="2.5"/><circle cx="6" cy="19" r="2.5"/><path d="M6 7.5v9M18 7.5c0 6-12 2-12 8"/></g></svg>"#;
 pub(super) const FOLDER_ICON: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M3 7V5a1 1 0 0 1 1-1h5l2 3h9a1 1 0 0 1 1 1v11a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1V7Zm0 3h18" fill="none" stroke="black" stroke-width="1.6" stroke-linejoin="round"/></svg>"#;
@@ -13,8 +14,9 @@ pub(super) struct State {
     pub(super) creating: bool,
     pub(super) error: Option<String>,
     pub(super) input: Option<Entity<PromptInput>>,
-    /// Checkout the new worktree branches from.
+    /// Checkout the new worktree branches from, and the machine it is on.
     pub(super) input_directory: Option<String>,
+    pub(super) input_location: Option<Location>,
     creation: Option<gpui::Task<()>>,
 }
 
@@ -121,8 +123,64 @@ impl Workspace {
         self.sessions.push(session);
     }
 
+    /// Open a chat in `directory` on `location`: a local draft, or a WSL
+    /// draft whose session the bridge creates on that distribution.
+    pub(super) fn open_session_in(
+        &mut self,
+        location: &Location,
+        directory: String,
+        title: String,
+        cx: &mut Context<Self>,
+    ) {
+        match location.host() {
+            None => self.open_local_draft(Some(directory), cx),
+            Some(host) => {
+                let request_id = pending::next_remote_draft_id(&host);
+                self.mount_session_draft(request_id.clone(), Some(directory.clone()), title, cx);
+                self.bridge.send(Command::CreateRemoteSession {
+                    host,
+                    working_dir: Some(directory),
+                    request_id: Some(request_id),
+                });
+            }
+        }
+    }
+
+    /// Shared by `/worktree` and the sidebar: create `branch` from HEAD of
+    /// `directory` in its own checkout on the same machine (Git runs on a
+    /// background thread, through wsl.exe for WSL), then open a chat there.
+    /// `done` sees the result, `Ok(path)` after the chat was opened.
+    pub(super) fn create_worktree_session(
+        &mut self,
+        location: Location,
+        directory: String,
+        branch: String,
+        cx: &mut Context<Self>,
+        done: impl FnOnce(&mut Self, Result<String, String>, &mut Context<Self>) + 'static,
+    ) -> gpui::Task<()> {
+        let task = cx.background_executor().spawn({
+            let location = location.clone();
+            let branch = branch.clone();
+            async move { session_git::create_worktree(&location, &directory, &branch) }
+        });
+        cx.spawn(async move |this, cx| {
+            let result = task.await;
+            let _ = this.update(cx, |this, cx| {
+                if let Ok(path) = &result {
+                    // The new thread is what makes the worktree appear
+                    // under its project, so always open one.
+                    this.focus_pending = true;
+                    this.open_session_in(&location, path.clone(), format!("{branch} · worktree"), cx);
+                }
+                done(this, result, cx);
+                cx.notify();
+            });
+        })
+    }
+
     pub(super) fn begin_worktree(
         &mut self,
+        location: Location,
         directory: String,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -149,6 +207,7 @@ impl Workspace {
         self.focus_pending = false;
         self.worktrees.input = Some(input);
         self.worktrees.input_directory = Some(directory);
+        self.worktrees.input_location = Some(location);
         self.worktrees.error = None;
         cx.notify();
     }
@@ -157,6 +216,7 @@ impl Workspace {
         if !self.worktrees.creating {
             self.worktrees.input = None;
             self.worktrees.input_directory = None;
+            self.worktrees.input_location = None;
             self.worktrees.error = None;
             self.focus_pending = true;
             cx.notify();
@@ -178,42 +238,53 @@ impl Workspace {
         }
         self.worktrees.creating = true;
         self.worktrees.error = None;
-        let task = cx.background_executor().spawn(async move {
-            jcode_sdk::worktrees::create(&directory, &branch).map_err(|error| format!("{error:#}"))
-        });
-        self.worktrees.creation = Some(cx.spawn(async move |this, cx| {
-            let result = task.await;
-            let _ = this.update(cx, |this, cx| {
+        let location = self
+            .worktrees
+            .input_location
+            .clone()
+            .unwrap_or(Location::Local);
+        self.worktrees.creation = Some(self.create_worktree_session(
+            location,
+            directory,
+            branch,
+            cx,
+            |this, result, _| {
                 this.worktrees.creating = false;
                 match result {
-                    Ok(entry) => {
+                    Ok(_) => {
                         this.worktrees.input = None;
                         this.worktrees.input_directory = None;
-                        // The new thread is what makes the worktree appear
-                        // under its project, so always open one.
-                        this.focus_pending = true;
-                        this.open_local_draft(Some(entry.path), cx);
+                        this.worktrees.input_location = None;
                     }
                     Err(error) => this.worktrees.error = Some(error),
                 }
-                cx.notify();
-            });
-        }));
+            },
+        ));
         cx.notify();
     }
 
     /// Inline form shown above the thread list while naming a new worktree.
     pub(super) fn render_worktree_form(&self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
         let input = self.worktrees.input.clone()?;
+        let machine = self
+            .worktrees
+            .input_location
+            .as_ref()
+            .and_then(Location::host)
+            .map(|host| format!(" on {host}"))
+            .unwrap_or_default();
         let origin = self
             .worktrees
             .input_directory
             .as_deref()
             .map(|dir| {
-                Path::new(dir)
-                    .file_name()
-                    .map(|name| name.to_string_lossy().into_owned())
-                    .unwrap_or_else(|| dir.to_owned())
+                let name = dir
+                    .trim_end_matches(['/', '\\'])
+                    .rsplit(['/', '\\'])
+                    .next()
+                    .filter(|name| !name.is_empty())
+                    .unwrap_or(dir);
+                format!("{name}{machine}")
             })
             .unwrap_or_default();
         Some(
@@ -404,6 +475,25 @@ impl Workspace {
                     ),
             )
             .into_any_element()
+    }
+}
+
+/// Removes a worktree and its branch that a test created, even on panic.
+#[cfg(test)]
+pub(super) struct WslWorktreeCleanup {
+    pub repo: String,
+    pub path: Option<String>,
+    pub branch: String,
+}
+
+#[cfg(test)]
+impl Drop for WslWorktreeCleanup {
+    fn drop(&mut self) {
+        let wsl = jcode_desktop_harness::session_git::Location::Wsl(None);
+        if let Some(path) = &self.path {
+            let _ = wsl.git(&self.repo, &["worktree", "remove", "--", path]);
+        }
+        let _ = wsl.git(&self.repo, &["branch", "-d", "--", &self.branch]);
     }
 }
 

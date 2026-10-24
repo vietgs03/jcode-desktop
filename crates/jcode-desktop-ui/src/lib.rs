@@ -225,6 +225,11 @@ pub fn bind_workspace_keys(cx: &mut App) {
         KeyBinding::new("ctrl-alt-o", ToggleOverview, None),
         #[cfg(windows)]
         KeyBinding::new("ctrl-alt-b", ToggleSidebar, None),
+        // Win+T cycles taskbar apps. Ctrl+` matches VS Code's terminal toggle.
+        #[cfg(windows)]
+        KeyBinding::new("ctrl-`", NewTerminal, None),
+        #[cfg(windows)]
+        KeyBinding::new("ctrl-alt-t", NewTerminal, None),
         #[cfg(windows)]
         KeyBinding::new("ctrl-alt-home", FocusFirst, None),
         #[cfg(windows)]

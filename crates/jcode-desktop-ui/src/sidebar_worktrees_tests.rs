@@ -8,9 +8,13 @@ struct Fixture {
     search: String,
 }
 
+fn real_path(path: &Path) -> PathBuf {
+    sidebar_projects::plain_canonical(path).unwrap()
+}
+
 fn fixture() -> Fixture {
     let temp = tempfile::tempdir().unwrap();
-    let root = std::fs::canonicalize(temp.path()).unwrap();
+    let root = real_path(temp.path());
     let main = root.join("project");
     let gitdir = main.join(".git/worktrees/search");
     std::fs::create_dir_all(&gitdir).unwrap();
@@ -271,9 +275,7 @@ fn worktree_create_runs_real_git_and_the_new_branch_joins_its_project(
     cx: &mut gpui::TestAppContext,
 ) {
     let temporary = tempfile::tempdir().unwrap();
-    let repository = std::fs::canonicalize(temporary.path())
-        .unwrap()
-        .join("project");
+    let repository = real_path(temporary.path()).join("project");
     std::fs::create_dir(&repository).unwrap();
     let git = |args: &[&str]| {
         let output = std::process::Command::new("git")
@@ -297,11 +299,28 @@ fn worktree_create_runs_real_git_and_the_new_branch_joins_its_project(
     git(&["commit", "-m", "fixture"]);
     std::fs::write(repository.join("tracked"), "dirty original").unwrap();
     let directory = repository.to_str().unwrap().to_owned();
+    cx.executor().allow_parking();
     let (workspace, vcx, commands) = setup(cx, vec![session("main-chat", &directory)]);
     click(vcx, "sidebar-project-worktree-0");
+    assert!(text(vcx, "worktree-create-form"), "the + opened the form");
     vcx.simulate_keystrokes("f e a t u r e - a enter");
-    vcx.run_until_parked();
-    let created = match commands.try_recv().unwrap() {
+    // Git runs on a background thread; Windows process start is slow.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    let command = loop {
+        vcx.run_until_parked();
+        if let Ok(command) = commands.try_recv() {
+            break command;
+        }
+        let (creating, error) =
+            workspace.read_with(vcx, |w, _| (w.worktrees.creating, w.worktrees.error.clone()));
+        assert!(error.is_none(), "{error:?}");
+        assert!(
+            creating && std::time::Instant::now() < deadline,
+            "no session requested (creating: {creating})"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    };
+    let created = match command {
         Command::CreateSession {
             working_dir: Some(directory),
             ..
@@ -338,4 +357,105 @@ fn worktree_create_runs_real_git_and_the_new_branch_joins_its_project(
             .count()
     });
     assert_eq!(branches, 2);
+}
+
+/// Windows with WSL, opt-in: `JCODE_WSL_TEST_REPO=/home/me/repo` with an
+/// uncommitted change. A WSL chat in that repository gets a project header
+/// with its branch and dirty marker from the background probe, and the
+/// header's "New worktree" creates a WSL worktree and opens a WSL chat that
+/// joins the same project on its own branch row.
+#[gpui::test]
+fn wsl_project_shows_branch_and_creates_a_wsl_worktree(cx: &mut gpui::TestAppContext) {
+    let Ok(repo) = std::env::var("JCODE_WSL_TEST_REPO") else {
+        return;
+    };
+    cx.executor().allow_parking();
+    let (workspace, vcx, commands) = setup(cx, vec![session("ssh://wsl/session_wt_main", &repo)]);
+    let wait_for = |vcx: &mut gpui::VisualTestContext, what: &str, done: &dyn Fn(&mut gpui::VisualTestContext) -> bool| {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            workspace.update(vcx, |_, cx| cx.notify());
+            vcx.run_until_parked();
+            if done(vcx) {
+                return;
+            }
+            assert!(std::time::Instant::now() < deadline, "timed out waiting for {what}");
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+    };
+    wait_for(vcx, "the WSL branch pill", &|vcx| text(vcx, "sidebar-project-branch-0"));
+    let main_path = workspace.read_with(vcx, |w, _| {
+        let (location, main) = w
+            .sidebar_projects
+            .wsl_project(&format!("ssh://wsl{repo}"))
+            .cloned()
+            .expect("WSL repository project");
+        assert_eq!(location, jcode_desktop_harness::session_git::Location::Wsl(None));
+        main
+    });
+    assert_eq!(main_path, repo);
+    assert!(text(vcx, "sidebar-project-dirty-0"), "repo has an uncommitted change");
+    assert!(text(vcx, "sidebar-project-new-0"));
+
+    let branch = format!("wt-sidebar-{}", std::process::id());
+    let mut cleanup = super::WslWorktreeCleanup { repo: repo.clone(), path: None, branch: branch.clone() };
+    click(vcx, "sidebar-project-worktree-0");
+    assert!(text(vcx, "worktree-create-form"));
+    let keys = branch.chars().map(|c| c.to_string()).collect::<Vec<_>>().join(" ");
+    vcx.simulate_keystrokes(&format!("{keys} enter"));
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let (host, dir) = loop {
+        vcx.run_until_parked();
+        match commands.try_recv() {
+            Ok(Command::CreateRemoteSession { host, working_dir, .. }) => break (host, working_dir),
+            Ok(_) => continue,
+            Err(_) => {
+                let error = workspace.read_with(vcx, |w, _| w.worktrees.error.clone());
+                assert!(error.is_none(), "{error:?}");
+                assert!(std::time::Instant::now() < deadline, "no WSL session requested");
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+        }
+    };
+    let dir = dir.expect("worktree directory");
+    cleanup.path = Some(dir.clone());
+    assert_eq!(host, "wsl");
+    assert!(dir.ends_with(&format!("-worktrees/{branch}")), "{dir}");
+    let wsl = jcode_desktop_harness::session_git::Location::Wsl(None);
+    assert_eq!(wsl.git(&dir, &["branch", "--show-current"]).unwrap().trim(), branch);
+    workspace.read_with(vcx, |w, cx| {
+        assert!(w.worktrees.input.is_none() && !w.worktrees.creating);
+        assert_eq!(w.slots[w.active].panel.read(cx).working_dir.as_deref(), Some(dir.as_str()));
+    });
+    // The pending WSL chat joins the repository project on its own branch row.
+    wait_for(vcx, "two checkout rows", &|vcx| {
+        workspace.read_with(vcx, |w, _| {
+            w.sidebar_session_layout.iter().filter(|row| row.checkout_header).count() == 2
+        })
+    });
+    assert!(!text(vcx, "sidebar-project-1"), "the worktree shares its repository's project");
+    let rows = workspace.read_with(vcx, |w, _| {
+        w.sidebar_session_layout
+            .iter()
+            .enumerate()
+            .filter(|(_, row)| row.checkout_header)
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>()
+    });
+    assert!(text(vcx, &format!("sidebar-checkout-dirty-{}", rows[0])), "main checkout is dirty");
+    assert!(!text(vcx, &format!("sidebar-checkout-dirty-{}", rows[1])), "new worktree is clean");
+    let labels = workspace.read_with(vcx, |w, _| {
+        w.sidebar_session_layout.iter().map(|row| row.session_id.clone()).collect::<Vec<_>>()
+    });
+    assert_eq!(labels[0], "ssh://wsl/session_wt_main", "main checkout leads");
+    // The branch row's + opens another WSL chat in the worktree.
+    click(vcx, &format!("sidebar-checkout-new-{}", rows[1]));
+    let again = std::iter::from_fn(|| commands.try_recv().ok()).find_map(|command| match command {
+        Command::CreateRemoteSession { host, working_dir, .. } => Some((host, working_dir)),
+        _ => None,
+    });
+    assert_eq!(again, Some(("wsl".to_owned(), Some(dir.clone()))), "WSL chat in the worktree");
+    drop(cleanup);
+    assert!(!wsl.git(&repo, &["worktree", "list"]).unwrap().contains(&dir));
+    eprintln!("sidebar created and removed WSL worktree {dir}");
 }

@@ -237,7 +237,7 @@ impl Workspace {
     /// on the same machine as this session (local or WSL), then open a new chat
     /// there. The original checkout and its uncommitted work are untouched.
     fn slash_worktree(&mut self, source: Entity<Panel>, branch: String, cx: &mut Context<Self>) {
-        use jcode_desktop_harness::session_git::{Location, create_worktree};
+        use jcode_desktop_harness::session_git::Location;
         let (session_id, directory) = {
             let panel = source.read(cx);
             (panel.session_id.clone(), panel.working_dir.clone())
@@ -257,34 +257,13 @@ impl Workspace {
         source.update(cx, |panel, cx| {
             panel.workspace_command_notice(format!("Creating worktree `{branch}` from HEAD of `{directory}`…"), cx)
         });
-        let task = cx.background_executor().spawn({
-            let location = location.clone();
-            async move { create_worktree(&location, &directory, &branch).map(|path| (path, branch)) }
-        });
-        cx.spawn(async move |this, cx| {
-            let result = task.await;
-            let _ = this.update(cx, |this, cx| match result {
-                Ok((path, branch)) => {
-                    source.update(cx, |panel, cx| panel.workspace_command_notice(format!("Worktree ready: branch `{branch}` at `{path}`. Opened a new chat there. Merge or remove it with git when done (`git worktree remove`)."), cx));
-                    this.focus_pending = true;
-                    match location.host() {
-                        None => this.open_local_draft(Some(path), cx),
-                        Some(host) => {
-                            let request_id = pending::next_remote_draft_id(&host);
-                            this.mount_session_draft(request_id.clone(), Some(path.clone()), format!("{branch} · worktree"), cx);
-                            this.bridge.send(Command::CreateRemoteSession {
-                                host,
-                                working_dir: Some(path),
-                                request_id: Some(request_id),
-                            });
-                        }
-                    }
-                    cx.notify();
-                }
-                Err(error) => source.update(cx, |panel, cx| {
-                    panel.workspace_command_notice(format!("Could not create the worktree: {error}"), cx)
-                }),
-            });
+        let notice_branch = branch.clone();
+        self.create_worktree_session(location, directory, branch, cx, move |_, result, cx| {
+            let message = match result {
+                Ok(path) => format!("Worktree ready: branch `{notice_branch}` at `{path}`. Opened a new chat there. Merge or remove it with git when done (`git worktree remove`)."),
+                Err(error) => format!("Could not create the worktree: {error}"),
+            };
+            source.update(cx, |panel, cx| panel.workspace_command_notice(message, cx));
         })
         .detach();
     }
