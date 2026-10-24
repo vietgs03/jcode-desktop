@@ -1230,6 +1230,11 @@ fn code_block_with_selection(
     window: &gpui::Window,
     selection: Option<(&gpui::Entity<TextSelection>, SharedString, &gpui::App)>,
 ) -> gpui::AnyElement {
+    let copy_id: SharedString = match &selection {
+        Some((_, key, _)) => format!("md-copy-{key}-{:x}", hash(body)),
+        None => format!("md-copy-{:x}", hash(body)),
+    }
+    .into();
     let (plain, highlights) = highlight_code(body, lang);
     let line_count = plain.lines().count().max(1);
     let gutter = (1..=line_count)
@@ -1254,11 +1259,10 @@ fn code_block_with_selection(
     } else {
         styled.into_any_element()
     };
-    // Multi-line blocks always get the header so copy is reachable even when
-    // the fence carried no language.
-    let show_header = !lang.is_empty() || line_count > 1;
+    // Every fenced block gets the header so copy is always reachable, like
+    // the CLI's per-code-block copy target.
+    let show_header = true;
     let copy_body = body.to_string();
-    let copy_id: SharedString = format!("md-copy-{:x}", hash(body)).into();
 
     div()
         .flex()
@@ -1300,23 +1304,11 @@ fn code_block_with_selection(
                                 "{line_count} line{}",
                                 if line_count == 1 { "" } else { "s" }
                             ))
-                            .child(
-                                div()
-                                    .id(copy_id)
-                                    .debug_selector(|| "code-copy".into())
-                                    .cursor_pointer()
-                                    .text_color(Theme::global().TEXT_FAINT)
-                                    .hover(|el| el.text_color(Theme::global().TEXT))
-                                    .on_mouse_down(
-                                        gpui::MouseButton::Left,
-                                        move |_event, _window, cx| {
-                                            cx.write_to_clipboard(gpui::ClipboardItem::new_string(
-                                                copy_body.clone(),
-                                            ));
-                                        },
-                                    )
-                                    .child("copy"),
-                            ),
+                            .child(crate::markdown_copy::copy_button(
+                                copy_id,
+                                "code-copy",
+                                copy_body,
+                            )),
                     ),
             )
         })
@@ -2143,6 +2135,72 @@ fn list_row(
         .into_any_element()
 }
 
+/// Estimated rendered width of `text` at the 12.5px table size. Only used to
+/// size columns, so an approximation per char class is enough: wide (CJK,
+/// emoji) glyphs take two cells, everything else one.
+fn table_text_width(text: &str) -> f32 {
+    const CELL: f32 = 7.0;
+    text.chars()
+        .map(|c| match c as u32 {
+            0x1100..=0x115F
+            | 0x2E80..=0xA4CF
+            | 0xAC00..=0xD7A3
+            | 0xF900..=0xFAFF
+            | 0xFF00..=0xFF60
+            | 0x1F300..=0x1FAFF => 2.0,
+            _ => 1.0,
+        })
+        .sum::<f32>()
+        * CELL
+}
+
+/// Per-column (min width, grow weight) from content. The minimum keeps the
+/// longest word readable (capped so one URL cannot claim the whole table);
+/// the weight shares remaining space by how much text each column holds.
+fn table_column_layout(header: &[String], rows: &[Vec<String>], columns: usize) -> Vec<(f32, f32)> {
+    const PADDING: f32 = 20.0;
+    (0..columns)
+        .map(|column| {
+            let cells = std::iter::once(header.get(column))
+                .chain(rows.iter().map(|row| row.get(column)))
+                .flatten()
+                .map(|cell| inline_spans(cell).plain);
+            let mut longest_word = 0.0f32;
+            let mut longest_cell = 0.0f32;
+            for plain in cells {
+                longest_cell = longest_cell.max(table_text_width(&plain));
+                for word in plain.split_whitespace() {
+                    longest_word = longest_word.max(table_text_width(word));
+                }
+            }
+            let min = (longest_word + PADDING).clamp(48.0, 160.0);
+            let weight = (longest_cell + PADDING).clamp(min, 420.0);
+            (min, weight)
+        })
+        .collect()
+}
+
+fn table_markdown(header: &[String], rows: &[Vec<String>], columns: usize) -> String {
+    let line = |cells: &[String]| {
+        let mut out = String::from("|");
+        for index in 0..columns {
+            out.push(' ');
+            out.push_str(cells.get(index).map(String::as_str).unwrap_or(""));
+            out.push_str(" |");
+        }
+        out
+    };
+    let mut out = line(header);
+    out.push('\n');
+    out.push('|');
+    out.push_str(&" --- |".repeat(columns));
+    for row in rows {
+        out.push('\n');
+        out.push_str(&line(row));
+    }
+    out
+}
+
 fn table(
     header: Vec<String>,
     rows: Vec<Vec<String>>,
@@ -2154,64 +2212,99 @@ fn table(
     let columns = header
         .len()
         .max(rows.iter().map(Vec::len).max().unwrap_or(0));
+    let layout = table_column_layout(&header, &rows, columns);
+    let min_width: f32 = layout.iter().map(|(min, _)| min).sum();
+    let source = table_markdown(&header, &rows, columns);
+    // Every row resolves the same flex inputs against the same width, so the
+    // columns line up. Cells never shrink below their minimum: a table wider
+    // than the panel scrolls horizontally instead of overlapping.
     let cell = |text: &str, row: usize, column: usize, window: &gpui::Window| {
+        let (min, weight) = layout[column];
+        let cell_key = table_cell_key(&key, row, column);
+        let selector = format!("table-cell-{cell_key}");
         div()
-            .flex_1()
-            .min_w_0()
+            .debug_selector(move || selector)
+            .flex_basis(px(0.))
+            .flex_grow(weight)
+            .flex_shrink_0()
+            .min_w(px(min))
+            .overflow_hidden()
             .px_2p5()
             .py_1p5()
+            .when(column > 0, |el| el.border_l_1().border_color(Theme::global().PANEL_BORDER))
             .line_height(relative(1.45))
-            .child(styled_line(
-                text,
-                selection,
-                table_cell_key(&key, row, column),
-                window,
-                cx,
-            ))
+            .whitespace_normal()
+            .child(styled_line(text, selection, cell_key, window, cx))
     };
+    let scroll_id: SharedString = format!("md-table-{key}").into();
+    let copy_id: SharedString = format!("md-table-copy-{key}-{:x}", hash(&source)).into();
     div()
         .flex()
         .flex_col()
         .my_1()
         .w_full()
-        .overflow_hidden()
-        .rounded_md()
-        .border_1()
-        .border_color(Theme::global().PANEL_BORDER)
-        .text_size(px(12.5))
+        .child(
+            div()
+                .id(gpui::ElementId::Name(scroll_id))
+                .debug_selector(|| "md-table".into())
+                .w_full()
+                .overflow_x_scroll()
+                .rounded_md()
+                .border_1()
+                .border_color(Theme::global().PANEL_BORDER)
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .w_full()
+                        .min_w(px(min_width))
+                        .text_size(px(12.5))
+                        .child(
+                            div()
+                                .flex()
+                                .flex_row()
+                                .bg(Theme::global().CODE_HEADER_BG)
+                                .border_b_1()
+                                .border_color(Theme::global().PANEL_BORDER)
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .text_color(Theme::global().HEADING)
+                                .children((0..columns).map(|index| {
+                                    cell(
+                                        header.get(index).map(String::as_str).unwrap_or(""),
+                                        0,
+                                        index,
+                                        window,
+                                    )
+                                })),
+                        )
+                        .children(rows.iter().enumerate().map(|(row_index, row)| {
+                            div()
+                                .flex()
+                                .flex_row()
+                                .when(row_index > 0, |el| {
+                                    el.border_t_1().border_color(Theme::global().PANEL_BORDER)
+                                })
+                                .when(row_index % 2 == 1, |el| el.bg(Theme::global().TABLE_STRIPE))
+                                .text_color(Theme::global().TEXT)
+                                .children((0..columns).map(|index| {
+                                    cell(
+                                        row.get(index).map(String::as_str).unwrap_or(""),
+                                        row_index + 1,
+                                        index,
+                                        window,
+                                    )
+                                }))
+                        })),
+                ),
+        )
         .child(
             div()
                 .flex()
                 .flex_row()
-                .bg(Theme::global().CODE_HEADER_BG)
-                .border_b_1()
-                .border_color(Theme::global().PANEL_BORDER)
-                .font_weight(FontWeight::SEMIBOLD)
-                .text_color(Theme::global().HEADING)
-                .children((0..columns).map(|index| {
-                    cell(
-                        header.get(index).map(String::as_str).unwrap_or(""),
-                        0,
-                        index,
-                        window,
-                    )
-                })),
+                .justify_end()
+                .pt_0p5()
+                .child(crate::markdown_copy::copy_button(copy_id, "table-copy", source)),
         )
-        .children(rows.into_iter().enumerate().map(|(row_index, row)| {
-            div()
-                .flex()
-                .flex_row()
-                .when(row_index % 2 == 1, |el| el.bg(Theme::global().TABLE_STRIPE))
-                .text_color(Theme::global().TEXT)
-                .children((0..columns).map(|index| {
-                    cell(
-                        row.get(index).map(String::as_str).unwrap_or(""),
-                        row_index + 1,
-                        index,
-                        window,
-                    )
-                }))
-        }))
         .into_any_element()
 }
 
@@ -2319,6 +2412,133 @@ mod tests {
             [("0-0".into(), "Title".into())]
         );
         assert!(selection_segments("\n***\n", 0, false, false).is_empty());
+    }
+
+    fn leak(selector: String) -> &'static str {
+        Box::leak(selector.into_boxed_str())
+    }
+
+    struct TableDocument {
+        selection: gpui::Entity<TextSelection>,
+        source: String,
+        width: f32,
+    }
+
+    impl gpui::Render for TableDocument {
+        fn render(
+            &mut self,
+            window: &mut gpui::Window,
+            cx: &mut gpui::Context<Self>,
+        ) -> impl IntoElement {
+            div()
+                .w(px(self.width))
+                .flex()
+                .flex_col()
+                .child(render(&self.source, 0, &self.selection, window, cx))
+        }
+    }
+
+    const AGENT_TABLE: &str = "| # | File | Thay đổi | Trạng thái | Ghi chú |\n|---|---|---|---|---|\n| 1 | `crates/jcode-desktop-ui/src/markdown_inline_code.rs` | Sửa lỗi chữ đè lên nhau trong bảng khi cột quá hẹp | ✅ Xong | https://github.com/1jehuang/jcode/blob/main/crates/jcode-tui/src/tui/ui.rs#L1200 |\n| 2 | `C:\\Users\\HASAKI\\dev\\jcode-desktop-wsl\\target\\debug\\jcode-desktop.exe` | Build 🚀 | ⏳ Đang chạy | dài dài dài dài dài dài dài dài dài dài dài dài dài |\n| 3 | a | b | c | d |";
+
+    #[gpui::test]
+    fn tables_never_overlap_and_rows_fit_wrapped_text(cx: &mut gpui::TestAppContext) {
+        let (view, vcx) = cx.add_window_view(|_, cx| TableDocument {
+            selection: cx.new(TextSelection::new),
+            source: AGENT_TABLE.into(),
+            width: 420.,
+        });
+        for width in [420., 1200.] {
+            view.update(vcx, |view, cx| {
+                view.width = width;
+                cx.notify();
+            });
+            vcx.run_until_parked();
+            let table = vcx.debug_bounds("md-table").expect("table paints");
+            assert!(table.size.width <= px(width + 0.5), "table fits panel {width}");
+            let mut rows = Vec::new();
+            for row in 0..4 {
+                let mut cells = Vec::new();
+                for column in 0..5 {
+                    let key = table_cell_key("0-0", row, column);
+                    let cell = vcx
+                        .debug_bounds(leak(format!("table-cell-{key}")))
+                        .unwrap_or_else(|| panic!("cell {key} at {width}"));
+                    let text = vcx
+                        .debug_bounds(leak(format!("selectable-text-{key}")))
+                        .unwrap_or_else(|| panic!("text {key} at {width}"));
+                    assert!(
+                        text.left() >= cell.left() - px(0.5)
+                            && text.right() <= cell.right() + px(0.5)
+                            && text.top() >= cell.top() - px(0.5)
+                            && text.bottom() <= cell.bottom() + px(0.5),
+                        "{key} text {text:?} escapes its cell {cell:?} at {width}"
+                    );
+                    cells.push((cell, text));
+                }
+                for pair in cells.windows(2) {
+                    assert!(
+                        pair[0].0.right() <= pair[1].0.left() + px(0.5),
+                        "row {row} cells overlap at {width}: {pair:?}"
+                    );
+                    assert!(!pair[0].1.intersects(&pair[1].1) || pair[0].1.right() <= pair[1].1.left() + px(0.5));
+                    assert_eq!(pair[0].0.size.height, pair[1].0.size.height, "row height shared");
+                }
+                rows.push(cells);
+            }
+            for pair in rows.windows(2) {
+                assert!(pair[0][0].0.bottom() <= pair[1][0].0.top() + px(0.5), "rows stack");
+            }
+            for column in 0..5 {
+                assert!(
+                    (rows[0][column].0.left() - rows[3][column].0.left()).abs() < px(0.5),
+                    "column {column} aligned at {width}"
+                );
+            }
+            let single = rows[3][0].1.size.height;
+            assert!(
+                rows[1][4].1.size.height > single * 1.5,
+                "long cells wrap and grow the row at {width}"
+            );
+        }
+    }
+
+    #[gpui::test]
+    fn table_copy_button_copies_markdown(cx: &mut gpui::TestAppContext) {
+        let (_view, vcx) = cx.add_window_view(|_, cx| TableDocument {
+            selection: cx.new(TextSelection::new),
+            source: "| a | b |\n|---|---|\n| 1 | `x` |".into(),
+            width: 600.,
+        });
+        vcx.run_until_parked();
+        let button = vcx.debug_bounds("table-copy").expect("table copy");
+        vcx.simulate_click(button.center(), Default::default());
+        vcx.run_until_parked();
+        assert_eq!(
+            vcx.update(|_, cx| cx.read_from_clipboard())
+                .and_then(|item| item.text())
+                .as_deref(),
+            Some("| a | b |\n| --- | --- |\n| 1 | `x` |")
+        );
+        assert!(vcx.debug_bounds("table-copy-copied").is_some());
+    }
+
+    #[gpui::test]
+    fn long_inline_code_and_list_markers_stay_inside_narrow_panels(cx: &mut gpui::TestAppContext) {
+        let (_view, vcx) = cx.add_window_view(|_, cx| TableDocument {
+            selection: cx.new(TextSelection::new),
+            source: "## Heading with `crates/jcode-desktop-ui/src/a/very/long/path/that/never/breaks.rs`\n\n- `C:\\Users\\HASAKI\\dev\\jcode-desktop-wsl\\target\\debug\\deps\\jcode_desktop_ui.dll` và một dòng tiếng Việt khá dài để xuống dòng\n- ngắn".into(),
+            width: 300.,
+        });
+        vcx.run_until_parked();
+        for key in ["0-0", "0-1", "0-2"] {
+            let text = vcx
+                .debug_bounds(leak(format!("selectable-text-{key}")))
+                .unwrap_or_else(|| panic!("{key}"));
+            assert!(text.right() <= px(300.5), "{key} overflows: {text:?}");
+        }
+        let first = vcx.debug_bounds("selectable-text-0-1").unwrap();
+        let second = vcx.debug_bounds("selectable-text-0-2").unwrap();
+        assert!(first.bottom() <= second.top() + px(0.5), "list items do not overlap");
     }
 
     #[test]
@@ -2827,7 +3047,7 @@ mod tests {
                 "let βeta = 1;\nprintln!(\"hello\");",
                 true,
             ),
-            ("```\nβeta\n```", "βeta", false),
+            ("```\nβeta\n```", "βeta", true),
         ] {
             view.update(vcx, |view, cx| {
                 view.source = source.into();
@@ -2876,13 +3096,9 @@ mod tests {
                 vcx.update(|_, cx| {
                     cx.write_to_clipboard(gpui::ClipboardItem::new_string("old".into()))
                 });
-                vcx.simulate_event(gpui::MouseDownEvent {
-                    button: gpui::MouseButton::Left,
-                    position: copy.center(),
-                    modifiers: Default::default(),
-                    click_count: 1,
-                    first_mouse: false,
-                });
+                vcx.simulate_click(copy.center(), Default::default());
+                vcx.run_until_parked();
+                assert!(vcx.debug_bounds("code-copy-copied").is_some());
                 assert_eq!(
                     vcx.update(|_, cx| cx.read_from_clipboard())
                         .and_then(|item| item.text())

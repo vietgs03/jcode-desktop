@@ -21,6 +21,7 @@ mod inline_image;
 mod input;
 mod live_profile;
 mod markdown;
+mod markdown_copy;
 mod markdown_inline_code;
 pub mod memory;
 mod native_mermaid;

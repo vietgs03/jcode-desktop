@@ -3844,6 +3844,21 @@ impl Panel {
                         .into_any_element()
                     },
                 ))
+                // Settled responses get a CLI-style copy action for their
+                // markdown source, faint until the message is hovered.
+                .when(index != usize::MAX && !text.trim().is_empty(), |el| {
+                    el.group("assistant-response").child(
+                        div().flex().flex_row().justify_end().child(
+                            crate::markdown_copy::copy_button(
+                                format!("assistant-copy-{index}-{:x}", text.len()),
+                                "assistant-copy",
+                                text.clone(),
+                            )
+                            .opacity(0.35)
+                            .group_hover("assistant-response", |style| style.opacity(1.0)),
+                        ),
+                    )
+                })
                 .into_any_element(),
             // Thinking is secondary transcript text, not a separate card. Keep
             // the same presentation while streaming, settled, and restored.
@@ -4294,6 +4309,19 @@ impl Panel {
                                 .text_size(px(11.5))
                                 .line_height(relative(1.45))
                                 .text_color(Theme::global().CODE_TEXT)
+                                .child(
+                                    div().absolute().top_1().right_1().child(
+                                        crate::markdown_copy::copy_button(
+                                            format!("tool-copy-{index}-{:x}", output.len()),
+                                            "tool-output-copy",
+                                            if output.trim().is_empty() {
+                                                detail.clone()
+                                            } else {
+                                                strip_ansi(output)
+                                            },
+                                        ),
+                                    ),
+                                )
                                 .child(text_selection::plain(
                                     self.transcript_selection.clone(),
                                     format!("tool-detail-{index}"),
@@ -4304,8 +4332,18 @@ impl Panel {
                         )
                     })
                     .children(error.clone().map(|message| {
+                        let copy = crate::markdown_copy::copy_button(
+                            format!("tool-error-copy-{index}"),
+                            "tool-error-copy",
+                            strip_ansi(&message),
+                        );
                         div()
                             .debug_selector(|| "tool-error".into())
+                            .flex()
+                            .flex_row()
+                            .items_start()
+                            .gap_1()
+                            .child(copy)
                             .ml(px(24.0))
                             .pr_1()
                             .py_1()
@@ -8223,6 +8261,59 @@ mod tests {
             vcx.run_until_parked();
             settle_tool_details(&panel, vcx);
             assert!(vcx.debug_bounds("tool-detail").is_none());
+        }
+    }
+
+    #[gpui::test]
+    fn copy_buttons_copy_assistant_tool_output_and_errors(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| crate::bind_workspace_keys(cx));
+        let (workspace, vcx) = cx.add_window_view(|_, cx| {
+            let mut workspace =
+                crate::workspace::Workspace::for_test(crate::learning::Coach::new(), cx);
+            workspace.push_test_panel("session-a", cx);
+            workspace
+        });
+        let panel = workspace
+            .read_with(vcx, |workspace, _| workspace.test_panel(0))
+            .unwrap();
+        let clipboard = |vcx: &mut gpui::VisualTestContext| {
+            vcx.update(|_, cx| cx.read_from_clipboard())
+                .and_then(|item| item.text())
+        };
+        panel.update(vcx, |panel, cx| {
+            *panel.items = vec![
+                Item::Assistant("Hello **world**\n\n```\nls\n```".into()),
+                Item::Tool {
+                    call_id: "copy-tool".into(),
+                    name: "bash".into(),
+                    input: r#"{"command":"ls"}"#.into(),
+                    output: "file_a\nfile_b".into(),
+                    done: true,
+                    error: Some("exit status 2".into()),
+                },
+            ];
+            panel.expanded_tools.insert("copy-tool".into());
+            cx.notify();
+        });
+        vcx.run_until_parked();
+        settle_tool_details(&panel, vcx);
+        for (selector, expected) in [
+            ("assistant-copy", "Hello **world**\n\n```\nls\n```"),
+            ("code-copy", "ls"),
+            ("tool-output-copy", "file_a\nfile_b"),
+            ("tool-error-copy", "exit status 2"),
+        ] {
+            vcx.update(|_, cx| cx.write_to_clipboard(gpui::ClipboardItem::new_string("old".into())));
+            let button = vcx
+                .debug_bounds(selector)
+                .unwrap_or_else(|| panic!("{selector} paints"));
+            vcx.simulate_click(button.center(), gpui::Modifiers::default());
+            vcx.run_until_parked();
+            assert_eq!(clipboard(vcx).as_deref(), Some(expected), "{selector}");
+            assert!(
+                vcx.debug_bounds(Box::leak(format!("{selector}-copied").into_boxed_str())).is_some(),
+                "{selector} shows Copied feedback"
+            );
         }
     }
 
