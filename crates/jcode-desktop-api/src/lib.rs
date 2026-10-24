@@ -7,6 +7,7 @@ use std::ffi::c_void;
 
 mod image_ids;
 mod launch;
+pub mod terminal_target;
 mod window_launch;
 pub use image_ids::ImageIds;
 pub use launch::{LaunchMode, SHARED_SINGLE_PANEL};

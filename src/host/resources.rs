@@ -132,7 +132,7 @@ unsafe extern "C-unwind" fn terminal_create(
 fn spawn_terminal(working_dir: Option<&str>) -> anyhow::Result<TerminalResource> {
     #[cfg(windows)]
     {
-        return spawn_terminal_command(windows_terminal_command(working_dir));
+        return spawn_terminal_command(windows_terminal_command(working_dir)?);
     }
     #[allow(unreachable_code)]
     let shell = default_shell();
@@ -344,36 +344,22 @@ fn default_shell() -> String {
 }
 
 /// Windows has no `sh`, so the POSIX default exits immediately and the panel
-/// shows a dead terminal. When the default machine is a WSL distribution the
-/// user's work lives there, so open a login shell in its home directory.
-/// Otherwise use PowerShell in the requested Windows directory.
+/// shows a dead terminal. The UI names the target: a `wsl://` directory opens
+/// that distribution's shell there, a Windows path opens PowerShell in it.
+/// Parsing and argument building live in `jcode_desktop_api::terminal_target`
+/// so they are unit tested without building this binary.
 #[cfg(windows)]
-fn windows_terminal_command(working_dir: Option<&str>) -> CommandBuilder {
-    let mut command = match wsl_default_host() {
-        Some(host) => {
-            let mut command = CommandBuilder::new("wsl.exe");
-            if let Some(distro) = host
-                .to_ascii_lowercase()
-                .strip_suffix(".wsl")
-                .map(|stem| host[..stem.len()].to_owned())
-                .filter(|stem| !stem.is_empty())
-            {
-                command.arg("--distribution");
-                command.arg(distro);
-            }
-            command.arg("--cd");
-            command.arg("~");
-            command
-        }
-        None => {
-            let mut command = CommandBuilder::new("powershell.exe");
-            command.arg("-NoLogo");
-            if let Some(dir) = working_dir {
-                command.cwd(dir);
-            }
-            command
-        }
-    };
+fn windows_terminal_command(working_dir: Option<&str>) -> anyhow::Result<CommandBuilder> {
+    use jcode_desktop_api::terminal_target::{TerminalTarget, windows_launch};
+    let target = TerminalTarget::parse(working_dir).map_err(anyhow::Error::msg)?;
+    let launch = windows_launch(&target, wsl_default_host().as_deref());
+    let mut command = CommandBuilder::new(&launch.program);
+    for arg in &launch.args {
+        command.arg(arg);
+    }
+    if let Some(dir) = &launch.cwd {
+        command.cwd(dir);
+    }
     command.env("TERM", "xterm-256color");
     command.env("TERM_PROGRAM", "jcode-desktop");
     command.env("COLORTERM", "truecolor");
@@ -398,8 +384,9 @@ fn wsl_default_host() -> Option<String> {
         .trim()
         .trim_matches(|c| c == '"' || c == '\'')
         .to_owned();
-    let lower = host.to_ascii_lowercase();
-    (lower == "wsl" || (lower.ends_with(".wsl") && lower.len() > 4)).then_some(host)
+    jcode_desktop_api::terminal_target::wsl_host(&host)
+        .is_some()
+        .then_some(host)
 }
 
 #[cfg(test)]
