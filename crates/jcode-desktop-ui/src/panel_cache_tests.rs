@@ -446,3 +446,233 @@ fn running_tool_row_pulses_do_not_rebuild_the_panel(cx: &mut gpui::TestAppContex
         "a running tool row rebuilt Workspace {workspace} and Panel {panel} times in one second"
     );
 }
+
+/// Per-view and per-phase milliseconds since `before`, busiest first.
+fn profile_breakdown(before: &[(&'static str, crate::render_stats::ViewStat)]) -> String {
+    crate::render_stats::delta(before, &crate::render_stats::snapshot())
+        .iter()
+        .map(|(name, stat)| format!("{name}={}x/{:.1}ms", stat.renders, stat.nanos as f64 / 1e6))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Profile the real "open an old WSL session" frame: a sidebar listing the
+/// user's WSL sessions and a panel that just received a large history.
+/// Fixtures come from `JCODE_PROFILE_DIR` (`sessions.json` from `list_sessions`,
+/// `history.json` from `get_history`). Run with
+/// `open_session_frame_profile -- --ignored --nocapture`.
+#[gpui::test]
+#[ignore = "manual profiler over captured fixtures"]
+fn open_session_frame_profile(cx: &mut gpui::TestAppContext) {
+    let dir = std::path::PathBuf::from(std::env::var("JCODE_PROFILE_DIR").unwrap_or_else(|_| {
+        // The Windows checkout's sibling `profile` directory.
+        concat!(env!("CARGO_MANIFEST_DIR"), "/../../../profile").into()
+    }));
+    let sessions: Vec<jcode_sdk::SessionInfo> =
+        serde_json::from_slice(&std::fs::read(dir.join("sessions.json")).unwrap()).unwrap();
+    let sessions: Vec<_> = sessions
+        .into_iter()
+        .map(|mut session| {
+            session.session_id = format!("ssh://wsl/{}", session.session_id);
+            session.parent_session_id = session
+                .parent_session_id
+                .map(|id| format!("ssh://wsl/{id}"));
+            session
+        })
+        .collect();
+    #[derive(serde::Deserialize)]
+    struct History {
+        messages: Vec<jcode_sdk::HistoryMessage>,
+    }
+    let history: History =
+        serde_json::from_slice(&std::fs::read(dir.join("history.json")).unwrap()).unwrap();
+    let opened = sessions[0].session_id.clone();
+    let (workspace, vcx) = cx.add_window_view(|_, cx| {
+        let mut workspace = Workspace::for_test(learning::Coach::new(), cx);
+        workspace.push_test_panel(&opened, cx);
+        workspace
+    });
+    let panel = workspace.read_with(vcx, |w, _| w.test_panel(0).unwrap());
+    let before = crate::render_stats::snapshot();
+    let started = std::time::Instant::now();
+    workspace.update(vcx, |w, cx| {
+        w.apply(Update::Sessions { sessions }, cx);
+        cx.notify();
+    });
+    vcx.run_until_parked();
+    println!(
+        "PROFILE sessions_applied_frame={:?} {}",
+        started.elapsed(),
+        profile_breakdown(&before)
+    );
+    let before = crate::render_stats::snapshot();
+    let started = std::time::Instant::now();
+    panel.update(vcx, |panel, cx| {
+        panel.load_history(history.messages, Vec::new(), cx);
+    });
+    let load_ms = started.elapsed();
+    vcx.run_until_parked();
+    println!(
+        "PROFILE load_history={load_ms:?} first_frame_total={:?} {}",
+        started.elapsed(),
+        profile_breakdown(&before)
+    );
+    for label in ["workspace", "panel"] {
+        let before = crate::render_stats::snapshot();
+        let mut samples = Vec::new();
+        for _ in 0..20 {
+            let started = std::time::Instant::now();
+            if label == "workspace" {
+                workspace.update(vcx, |_, cx| cx.notify());
+            } else {
+                panel.update(vcx, |_, cx| cx.notify());
+            }
+            vcx.run_until_parked();
+            samples.push(started.elapsed().as_secs_f64() * 1000.0);
+        }
+        samples.sort_by(f64::total_cmp);
+        println!(
+            "PROFILE repaint_{label} p50={:.2}ms p95={:.2}ms max={:.2}ms {}",
+            samples[10],
+            samples[18],
+            samples[19],
+            profile_breakdown(&before)
+        );
+    }
+}
+
+/// Streamed deltas reach the panel through `Workspace::apply`, the path every
+/// bridge update takes. GPUI rebuilds the Workspace around a notified panel,
+/// so the sidebar model (every listed session grouped by project, hundreds of
+/// rows for a long WSL history) must come from its memo rather than be built
+/// again once per token.
+#[gpui::test]
+fn streamed_deltas_reuse_the_sidebar_model(cx: &mut gpui::TestAppContext) {
+    let session_id = "delta-stream";
+    let (workspace, vcx) = cx.add_window_view(|_, cx| {
+        let mut workspace = Workspace::for_test(learning::Coach::new(), cx);
+        workspace.push_test_panel(session_id, cx);
+        let mut sessions = (0..300)
+            .map(|n| super::tests::session_info(&format!("session_other_{n}"), Some("other")))
+            .collect::<Vec<_>>();
+        sessions.push(super::tests::session_info(session_id, Some("streaming")));
+        workspace.sessions = sessions;
+        workspace
+    });
+    let panel = workspace.read_with(vcx, |w, _| w.test_panel(0).unwrap());
+    let send = |vcx: &mut gpui::VisualTestContext, event: jcode_sdk::ApiEvent| {
+        workspace.update(vcx, |workspace, cx| {
+            let session_id = session_id.to_string();
+            if workspace.apply(Update::Event { session_id, event }, cx) {
+                cx.notify();
+            }
+        });
+        vcx.run_until_parked();
+    };
+    send(
+        vcx,
+        jcode_sdk::ApiEvent::SessionStatus {
+            session_id: session_id.into(),
+            status: "processing".into(),
+            pending_soft_interrupts: None,
+        },
+    );
+    let builds_before = view_renders("Workspace.sidebar.model");
+    let sidebar_before = view_renders("Workspace.sidebar");
+    let panel_before = count(&panel);
+    let started = std::time::Instant::now();
+    for index in 0..100 {
+        send(
+            vcx,
+            jcode_sdk::ApiEvent::TextDelta {
+                message_id: None,
+                session_id: session_id.into(),
+                text: format!("token {index} "),
+            },
+        );
+    }
+    let elapsed = started.elapsed();
+    let builds = view_renders("Workspace.sidebar.model") - builds_before;
+    let sidebars = view_renders("Workspace.sidebar") - sidebar_before;
+    let panel_renders = count(&panel) - panel_before;
+    eprintln!(
+        "100 deltas in {elapsed:?}: sidebar renders={sidebars} model builds={builds} panel={panel_renders}"
+    );
+    assert!(
+        panel_renders >= 50,
+        "the panel must paint the stream ({panel_renders})"
+    );
+    // The recency bump is throttled to once a second, so a burst rebuilds the
+    // model about once per second of wall time (debug Windows runs take
+    // several), never once per delta.
+    let allowed = elapsed.as_secs() + 2;
+    assert!(
+        builds <= allowed,
+        "100 streamed deltas in {elapsed:?} built the sidebar model {builds} times (allowed {allowed})"
+    );
+    assert!(
+        panel.read_with(vcx, |p, _| p.sidebar_activity().is_some()),
+        "the sidebar spinner still reports the streaming panel"
+    );
+}
+
+/// The memo must not hide real changes: a new session list, a renamed panel
+/// or a folded project rebuilds the rows.
+#[gpui::test]
+fn sidebar_model_rebuilds_when_its_inputs_change(cx: &mut gpui::TestAppContext) {
+    let (workspace, vcx) = cx.add_window_view(|_, cx| {
+        let mut workspace = Workspace::for_test(learning::Coach::new(), cx);
+        workspace.push_test_panel("memo-open", cx);
+        workspace.sessions = vec![super::tests::session_info("session_memo_1", Some("first"))];
+        workspace
+    });
+    vcx.run_until_parked();
+    let rows = |vcx: &mut gpui::VisualTestContext| {
+        workspace.read_with(vcx, |w, _| {
+            w.sidebar_model
+                .as_ref()
+                .map(|(_, model, _)| {
+                    model
+                        .ordered_sessions
+                        .iter()
+                        .map(|row| row.session.session_id.clone())
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default()
+        })
+    };
+    assert!(rows(vcx).contains(&"session_memo_1".to_string()));
+    let builds = view_renders("Workspace.sidebar.model");
+    workspace.update(vcx, |_, cx| cx.notify());
+    vcx.run_until_parked();
+    assert_eq!(
+        view_renders("Workspace.sidebar.model"),
+        builds,
+        "an unchanged sidebar reuses its rows"
+    );
+    workspace.update(vcx, |w, cx| {
+        w.apply(
+            Update::Sessions {
+                sessions: vec![
+                    super::tests::session_info("session_memo_1", Some("first")),
+                    super::tests::session_info("session_memo_2", Some("second")),
+                ],
+            },
+            cx,
+        );
+        cx.notify();
+    });
+    vcx.run_until_parked();
+    assert!(rows(vcx).contains(&"session_memo_2".to_string()));
+    let panel = workspace.read_with(vcx, |w, _| w.test_panel(0).unwrap());
+    let before = view_renders("Workspace.sidebar.model");
+    panel.update(vcx, |panel, cx| {
+        panel.title = "renamed".into();
+        cx.notify();
+    });
+    vcx.run_until_parked();
+    assert!(
+        view_renders("Workspace.sidebar.model") > before,
+        "a renamed panel rebuilds its sidebar row"
+    );
+}

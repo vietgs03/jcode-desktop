@@ -33,7 +33,7 @@ pub(super) struct Checkout {
 
 /// Branches move underneath us (checkout, rebase), so HEAD is re-read after
 /// this interval rather than on every hover repaint.
-const CHECKOUT_TTL: Duration = Duration::from_secs(3);
+pub(super) const CHECKOUT_TTL: Duration = Duration::from_secs(3);
 /// Git probes spawn processes (wsl.exe for WSL), so they refresh less often
 /// and always off the UI thread.
 const PROBE_TTL: Duration = Duration::from_secs(10);
@@ -62,6 +62,9 @@ pub(super) struct State {
     /// Background Git results: WSL session directories, and local checkout
     /// roots (for their dirty state).
     probes: HashMap<ProbeKey, (Option<CheckoutInfo>, Instant)>,
+    /// Bumped whenever background probe results land, so a memoized sidebar
+    /// knows its checkouts went stale.
+    probe_generation: u64,
     wanted: HashSet<ProbeKey>,
     probing: Option<gpui::Task<()>>,
     /// WSL repository projects by key, for their header actions.
@@ -88,6 +91,11 @@ impl State {
                 self.collapsed.insert(project.to_owned(), false);
             }
         }
+    }
+
+    /// See [`Self::probe_generation`] field docs.
+    pub(super) fn probe_generation(&self) -> u64 {
+        self.probe_generation
     }
 
     /// The last background result for a directory, queueing a refresh when it
@@ -365,6 +373,7 @@ impl Workspace {
                 for (key, info) in results {
                     this.sidebar_projects.probes.insert(key, (info, now));
                 }
+                this.sidebar_projects.probe_generation += 1;
                 this.sidebar_projects.probing = None;
                 cx.notify();
             });

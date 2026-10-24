@@ -36,6 +36,7 @@ thread_local! {
 pub struct Scope {
     name: &'static str,
     started: Instant,
+    quiet: bool,
 }
 
 /// Times one render of `name` until the returned guard drops.
@@ -44,16 +45,30 @@ pub fn scope(name: &'static str) -> Scope {
     Scope {
         name,
         started: Instant::now(),
+        quiet: false,
+    }
+}
+
+/// Times one phase inside a render, such as `Workspace.sidebar`. Phases are
+/// counted like views but never logged as slow on their own: the enclosing
+/// view's log line already reports the frame, and a profile delta names the
+/// phase that made it slow.
+#[must_use]
+pub fn phase(name: &'static str) -> Scope {
+    Scope {
+        name,
+        started: Instant::now(),
+        quiet: true,
     }
 }
 
 impl Drop for Scope {
     fn drop(&mut self) {
-        record(self.name, self.started.elapsed());
+        record(self.name, self.started.elapsed(), self.quiet);
     }
 }
 
-fn record(name: &'static str, elapsed: Duration) {
+fn record(name: &'static str, elapsed: Duration, quiet: bool) {
     let nanos = elapsed.as_nanos().min(u64::MAX as u128) as u64;
     TABLE.with(|table| {
         let Ok(mut table) = table.try_borrow_mut() else {
@@ -69,7 +84,7 @@ fn record(name: &'static str, elapsed: Duration) {
         stat.renders += 1;
         stat.nanos += nanos;
         stat.max_nanos = stat.max_nanos.max(nanos);
-        if elapsed >= SLOW_RENDER {
+        if !quiet && elapsed >= SLOW_RENDER {
             let now = Instant::now();
             if table
                 .last_slow_log
@@ -235,16 +250,16 @@ mod tests {
     #[test]
     fn scopes_accumulate_per_view_and_delta_reports_only_active_views() {
         let before = snapshot();
-        record("TestViewA", Duration::from_micros(300));
-        record("TestViewA", Duration::from_micros(100));
-        record("TestViewB", Duration::from_micros(50));
+        record("TestViewA", Duration::from_micros(300), false);
+        record("TestViewA", Duration::from_micros(100), false);
+        record("TestViewB", Duration::from_micros(50), true);
         let middle = snapshot();
         let changes = delta(&before, &middle);
         let a = changes.iter().find(|(n, _)| *n == "TestViewA").unwrap().1;
         assert_eq!(a.renders, 2);
         assert_eq!(a.nanos, 400_000);
         assert_eq!(changes[0].0, "TestViewA", "busiest view first");
-        record("TestViewB", Duration::from_micros(20));
+        record("TestViewB", Duration::from_micros(20), false);
         let changes = delta(&middle, &snapshot());
         assert!(changes.iter().all(|(n, _)| *n != "TestViewA"));
         assert_eq!(

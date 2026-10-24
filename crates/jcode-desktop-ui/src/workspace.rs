@@ -839,6 +839,8 @@ pub struct Workspace {
     sidebar_scroll: ScrollHandle,
     sidebar_sessions_list: gpui::ListState,
     sidebar_session_layout: Vec<SidebarSessionLayout>,
+    /// Memoized sidebar rows, with when they were built.
+    sidebar_model: Option<(SidebarModelKey, std::rc::Rc<SidebarModel>, Instant)>,
     sidebar_projects: sidebar_projects::State,
     sidebar_selection: sidebar_selection::Selection,
     sidebar_gesture: Option<sidebar_gesture::Pending>,
@@ -1157,6 +1159,7 @@ impl Workspace {
             sidebar_scroll: ScrollHandle::new(),
             sidebar_sessions_list: gpui::ListState::new(0, gpui::ListAlignment::Top, px(100.0)),
             sidebar_session_layout: Vec::new(),
+            sidebar_model: None,
             sidebar_projects: Default::default(),
             sidebar_selection: Default::default(),
             sidebar_gesture: None,
@@ -1544,6 +1547,7 @@ impl Workspace {
             sidebar_scroll: ScrollHandle::new(),
             sidebar_sessions_list: gpui::ListState::new(0, gpui::ListAlignment::Top, px(100.0)),
             sidebar_session_layout: Vec::new(),
+            sidebar_model: None,
             sidebar_projects: Default::default(),
             sidebar_selection: Default::default(),
             sidebar_gesture: None,
@@ -2354,7 +2358,16 @@ impl Workspace {
                     // Live SDK events arrive before the next persisted metadata
                     // refresh. Advance recency immediately so active work moves
                     // exactly as it does in the TUI picker.
-                    session.updated_at_ms = Some(unix_now_ms());
+                    // Once a second is enough to move the row: streamed
+                    // deltas arrive many times a second, and every changed
+                    // session invalidates the memoized sidebar model.
+                    let now = unix_now_ms();
+                    if session
+                        .updated_at_ms
+                        .is_none_or(|previous| now.saturating_sub(previous) >= 1_000)
+                    {
+                        session.updated_at_ms = Some(now);
+                    }
                 }
                 let updated_title = match &event {
                     jcode_sdk::ApiEvent::SessionRenamed { display_title, .. } => {
@@ -5459,48 +5472,70 @@ impl Workspace {
         self.daemon_running.get(session_id).cloned()
     }
 
-    fn render_sidebar(&mut self, fullscreen: bool, cx: &mut Context<Self>) -> gpui::AnyElement {
-        let active_id = self
-            .slots
-            .get(self.active)
-            .map(|slot| slot.panel.read(cx).session_id.clone());
-        let open_marks = self
-            .slots
-            .iter()
-            .filter(|slot| !slot.closing)
-            .map(|slot| {
-                let panel = slot.panel.read(cx);
-                (panel.session_id.clone(), panel.sidebar_activity())
-            })
-            .collect::<HashMap<_, _>>();
-        let open_todos = self
+    /// Sidebar rows grouped by project and checkout. Building them walks every
+    /// listed session (hundreds with a long WSL history) and took most of a
+    /// Workspace render, so the model is kept until one of its inputs changes:
+    /// a frame where only a panel's transcript changed reuses it.
+    fn sidebar_model(
+        &mut self,
+        active_id: &Option<String>,
+        open_marks: &HashMap<String, Option<gpui::AnyView>>,
+        cx: &mut Context<Self>,
+    ) -> std::rc::Rc<SidebarModel> {
+        let slots = self
             .slots
             .iter()
             .map(|slot| {
                 let panel = slot.panel.read(cx);
-                (panel.session_id.clone(), panel.latest_todo_progress())
+                (
+                    panel.session_id.clone(),
+                    slot.closing,
+                    slot.row,
+                    panel.supports_voice(),
+                    panel.working_dir.clone(),
+                    panel.title.to_string(),
+                )
             })
-            .collect::<HashMap<_, _>>();
-        let working = open_marks
-            .iter()
-            .filter(|(_, mark)| mark.is_some())
-            .map(|(id, _)| id.clone())
-            .chain(
-                self.daemon_running
-                    .keys()
-                    .filter(|id| !open_marks.contains_key(*id))
-                    .cloned(),
-            )
-            .collect::<HashSet<_>>();
-        self.sidebar_title_pulses.retain(|id| working.contains(id));
-        let open_titles = self
-            .slots
-            .iter()
-            .map(|slot| {
-                let panel = slot.panel.read(cx);
-                (panel.session_id.clone(), panel.title.to_string())
-            })
-            .collect::<HashMap<_, _>>();
+            .collect::<Vec<_>>();
+        let probes = self.sidebar_projects.probe_generation();
+        // Compared in place: cloning hundreds of sessions every frame to build
+        // a key would cost part of what the memo saves.
+        let fresh = self.sidebar_model.as_ref().is_some_and(|(key, _, at)| {
+            at.elapsed() < sidebar_projects::CHECKOUT_TTL
+                && key.probes == probes
+                && key.active_id == *active_id
+                && key.slots == slots
+                && key.sessions == self.sessions
+                && key.collections == self.collections.store
+                && key.collapsed == self.sidebar_projects.collapsed
+        });
+        if !fresh {
+            let model = std::rc::Rc::new(self.build_sidebar_model(active_id, open_marks, cx));
+            // Building reveals the focused project (`sync_focus`), so the key
+            // records the disclosure state the rows were built with.
+            let key = SidebarModelKey {
+                sessions: self.sessions.clone(),
+                slots,
+                active_id: active_id.clone(),
+                collections: self.collections.store.clone(),
+                collapsed: self.sidebar_projects.collapsed.clone(),
+                probes: self.sidebar_projects.probe_generation(),
+            };
+            self.sidebar_model = Some((key, model, Instant::now()));
+        }
+        // Branch, dirty and WSL checkouts asked for while building load in
+        // the background.
+        self.schedule_checkout_probes(cx);
+        self.sidebar_model.as_ref().unwrap().1.clone()
+    }
+
+    fn build_sidebar_model(
+        &mut self,
+        active_id: &Option<String>,
+        open_marks: &HashMap<String, Option<gpui::AnyView>>,
+        cx: &mut Context<Self>,
+    ) -> SidebarModel {
+        let _phase = crate::render_stats::phase("Workspace.sidebar.model");
         // A session which already has a panel is navigation. Everything else
         // is an invitation to open another panel, so keep those two actions in
         // visibly separate sections. Preserve the TUI saved/recency ordering
@@ -5538,6 +5573,7 @@ impl Workspace {
                 });
             }
         }
+        let swarm_phase = crate::render_stats::phase("Workspace.sidebar.swarm");
         let ordered_sessions = sidebar_session_order(&catalog);
         let swarm = sidebar_swarm::groups(&ordered_sessions);
         // Swarms and worktrees are one concept here: an agent is a thread. It
@@ -5633,6 +5669,8 @@ impl Workspace {
             .collect::<Vec<_>>();
         // Stable: open-before-history and recency survive inside each group.
         grouped.sort_by_key(|(_, session)| rank_collection(session));
+        drop(swarm_phase);
+        let group_phase = crate::render_stats::phase("Workspace.sidebar.group");
         for (live, session) in grouped {
             let open = self
                 .slots
@@ -5705,6 +5743,7 @@ impl Workspace {
                 agents,
             });
         }
+        drop(group_phase);
         // The main working tree leads, then worktrees in order of first use.
         for checkouts in &mut project_checkouts {
             checkouts.sort_by_key(|checkout| checkout.linked);
@@ -5746,8 +5785,6 @@ impl Workspace {
             active_id.as_deref(),
             active_project.map(|index| groups[index].0.key.as_str()),
         );
-        // Branch, dirty and WSL checkouts asked for above load in the background.
-        self.schedule_checkout_probes(cx);
         let headers = groups.len() > 1
             || groups
                 .first()
@@ -5797,6 +5834,68 @@ impl Workspace {
             .filter(|row| row.open && !row.collapsed)
             .map(|row| row.session.session_id.clone())
             .collect::<Vec<_>>();
+        SidebarModel {
+            groups,
+            ordered_sessions: std::rc::Rc::new(ordered_sessions),
+            collapsed_projects,
+            project_branches,
+            checkout_rows,
+            selection_order,
+        }
+    }
+
+    fn render_sidebar(&mut self, fullscreen: bool, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let _phase = crate::render_stats::phase("Workspace.sidebar");
+        let active_id = self
+            .slots
+            .get(self.active)
+            .map(|slot| slot.panel.read(cx).session_id.clone());
+        let open_marks = self
+            .slots
+            .iter()
+            .filter(|slot| !slot.closing)
+            .map(|slot| {
+                let panel = slot.panel.read(cx);
+                (panel.session_id.clone(), panel.sidebar_activity())
+            })
+            .collect::<HashMap<_, _>>();
+        let open_todos = self
+            .slots
+            .iter()
+            .map(|slot| {
+                let panel = slot.panel.read(cx);
+                (panel.session_id.clone(), panel.latest_todo_progress())
+            })
+            .collect::<HashMap<_, _>>();
+        let working = open_marks
+            .iter()
+            .filter(|(_, mark)| mark.is_some())
+            .map(|(id, _)| id.clone())
+            .chain(
+                self.daemon_running
+                    .keys()
+                    .filter(|id| !open_marks.contains_key(*id))
+                    .cloned(),
+            )
+            .collect::<HashSet<_>>();
+        self.sidebar_title_pulses.retain(|id| working.contains(id));
+        let open_titles = self
+            .slots
+            .iter()
+            .map(|slot| {
+                let panel = slot.panel.read(cx);
+                (panel.session_id.clone(), panel.title.to_string())
+            })
+            .collect::<HashMap<_, _>>();
+        let model = self.sidebar_model(&active_id, &open_marks, cx);
+        let SidebarModel {
+            groups,
+            ordered_sessions,
+            collapsed_projects,
+            project_branches,
+            checkout_rows,
+            selection_order,
+        } = (*model).clone();
         self.sidebar_selection.retain(&selection_order);
         // Keep only visible rows (plus a small overscan) in GPUI's layout and
         // text-shaping work. Hover invalidates this view, so eagerly building
@@ -5928,6 +6027,7 @@ impl Workspace {
                         let is_open = row.open;
                         let live = row.live;
                         let session = &row.session;
+                        let _phase = crate::render_stats::phase("Workspace.sidebar_row");
                         workspace.update(cx, |this, cx| {
                             let mut list = div()
                                 .w_full()
@@ -8393,7 +8493,9 @@ impl Render for Workspace {
             let root = self.render_single_panel(window, cx);
             return crate::window_caption::wrap(root, window, true);
         }
+        let applets_phase = crate::render_stats::phase("Workspace.applets");
         self.sidebar_applets = self.render_sidebar_applets(window, cx);
+        drop(applets_phase);
         self.restore_hidden_machine_focus(window, cx);
         if self.show_sidebar
             && self.layout_mode == crate::config::LayoutMode::Normal
@@ -8539,6 +8641,7 @@ impl Render for Workspace {
         } else {
             // One path for both the populated and the empty strip, so the
             // empty strip's gesture handling exists everywhere it paints.
+            let _phase = crate::render_stats::phase("Workspace.strip");
             self.render_row(self.active_row, viewport_w, viewport_h, window, cx)
         };
 
@@ -8682,6 +8785,7 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::move_panel_to_last))
             .on_action(cx.listener(Self::open_change_review))
             .on_action(cx.listener(Self::close_change_review))
+            .on_action(cx.listener(Self::open_working_tree_changes))
             .on_action(cx.listener(Self::new_panel))
             .on_action(cx.listener(Self::new_panel_in_pinned_directory))
             .on_action(cx.listener(Self::fork_panel))
@@ -8735,7 +8839,6 @@ impl Render for Workspace {
                             .flex()
                             .flex_col()
                             .pt(px(content_top_inset))
-            .on_action(cx.listener(Self::open_working_tree_changes))
                             .pl(px(connector_width))
                             .pr(px(right_margin))
                             .child(
@@ -9127,6 +9230,30 @@ struct SidebarSessionLayout {
     menu: bool,
 }
 
+/// What the sidebar rows are built from. See [`Workspace::sidebar_model`].
+#[derive(PartialEq)]
+struct SidebarModelKey {
+    sessions: Vec<jcode_sdk::SessionInfo>,
+    /// Per panel: session, closing, row, voice support, directory, title.
+    slots: Vec<(String, bool, usize, bool, Option<String>, String)>,
+    active_id: Option<String>,
+    collections: jcode_sdk::collections::Collections,
+    collapsed: HashMap<String, bool>,
+    probes: u64,
+}
+
+#[derive(Clone)]
+struct SidebarModel {
+    groups: Vec<(sidebar_projects::Project, usize, usize)>,
+    /// Shared, not copied, into the virtual list's row builder.
+    ordered_sessions: std::rc::Rc<Vec<SidebarRow>>,
+    collapsed_projects: Vec<bool>,
+    project_branches: Vec<Option<(String, bool)>>,
+    checkout_rows: Vec<bool>,
+    selection_order: Vec<String>,
+}
+
+#[derive(Clone)]
 struct SidebarRow {
     /// Local panel membership drives selection and navigation.
     open: bool,

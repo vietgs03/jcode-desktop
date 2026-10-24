@@ -4742,7 +4742,9 @@ impl Render for Panel {
         // leaving stale cards interspersed through the conversation.
         let instant_motion = self.tick_stream_reveal(window, cx);
         self.sync_applet_rows(cx);
+        let derived_phase = crate::render_stats::phase("Panel.derived");
         let derived = self.transcript_derived(cx);
+        drop(derived_phase);
         let rows = derived.rows.clone();
         let prompt_rows = derived.prompt_rows.clone();
         let latest_todo = derived.latest_todo.clone();
@@ -4967,6 +4969,7 @@ impl Render for Panel {
                                     .into_any_element();
                             }
                             let row = &list_rows[row_index];
+                            let _phase = crate::render_stats::phase("Panel.row");
                             panel.update(cx, |panel, cx| {
                                 let item = match &row.source {
                                     TranscriptRowSource::Settled(index) => &panel.items[*index],
