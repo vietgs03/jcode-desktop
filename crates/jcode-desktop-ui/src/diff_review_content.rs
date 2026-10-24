@@ -1,7 +1,7 @@
 //! Stateful rich comparison content for the file-tree review surface.
 use std::collections::HashMap;
 
-use gpui::{AnyElement, App, Entity, ScrollHandle, div, prelude::*};
+use gpui::{AnyElement, App, Entity, ScrollHandle, SharedString, div, prelude::*};
 
 use crate::{diff_model::DiffPreview, diff_view::DiffView};
 
@@ -10,6 +10,7 @@ pub(crate) struct ReviewContent {
     selected: usize,
     done: bool,
     failed: bool,
+    label: Option<SharedString>,
     views: HashMap<usize, (Entity<DiffView>, ScrollHandle)>,
 }
 
@@ -21,11 +22,24 @@ impl ReviewContent {
         failed: bool,
         cx: &mut App,
     ) -> Self {
+        Self::with_label(preview, selected, done, failed, None, cx)
+    }
+
+    /// Like `new`, but every file view shows `label` as its status.
+    pub(crate) fn with_label(
+        preview: DiffPreview,
+        selected: usize,
+        done: bool,
+        failed: bool,
+        label: Option<SharedString>,
+        cx: &mut App,
+    ) -> Self {
         let mut content = Self {
             preview,
             selected,
             done,
             failed,
+            label,
             views: HashMap::new(),
         };
         content.select(selected, cx);
@@ -45,6 +59,7 @@ impl ReviewContent {
                     cx,
                 );
                 view.set_status(self.done, self.failed, cx);
+                view.set_label(self.label.clone());
                 view
             });
             self.views.insert(selected, (view, ScrollHandle::new()));

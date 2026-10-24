@@ -1,7 +1,7 @@
 //! Read-only tool snapshots live beside their originating conversation.
 use super::*;
 
-pub(crate) use crate::ui_actions::{CloseChangeReview, OpenChangeReview};
+pub(crate) use crate::ui_actions::{CloseChangeReview, OpenChangeReview, OpenWorkingTreeChanges};
 
 impl Workspace {
     pub(super) fn close_change_review(
@@ -51,27 +51,88 @@ impl Workspace {
         if request.selected >= crate::diff::tool_diffs(&request.name, &request.input).len() {
             return;
         }
+        let request = request.clone();
+        self.open_review_column(
+            source_index,
+            move |panel, cx| panel.set_change_review(&request, cx),
+            window,
+            cx,
+        );
+    }
+
+    /// `/changes` and the footer Changes pill: the live working-tree review
+    /// for the source panel's checkout, in the same review column.
+    pub(super) fn open_working_tree_changes(
+        &mut self,
+        request: &OpenWorkingTreeChanges,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(source_index) = self
+            .slots
+            .iter()
+            .position(|slot| !slot.closing && slot.panel.entity_id() == request.source)
+        else {
+            return;
+        };
+        let source = self.slots[source_index].panel.read(cx);
+        let Some(location) =
+            jcode_desktop_harness::session_git::Location::of_session(&source.session_id)
+        else {
+            return;
+        };
+        let Some(directory) = source
+            .working_dir
+            .clone()
+            .filter(|directory| !directory.trim().is_empty())
+        else {
+            return;
+        };
+        let staged = request.staged;
+        self.open_review_column(
+            source_index,
+            move |panel, cx| {
+                panel.set_working_tree_review(location.clone(), directory.clone(), staged, cx)
+            },
+            window,
+            cx,
+        );
+    }
+
+    /// Show a review beside its source conversation, reusing that
+    /// conversation's review column (even after it moved) instead of opening
+    /// a new column per click. `fill` loads the column's content.
+    fn open_review_column(
+        &mut self,
+        source_index: usize,
+        fill: impl Fn(&mut Panel, &mut Context<Panel>) + 'static,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let source = self.slots[source_index].panel.read(cx);
         let session_id = format!("review://{}", source.session_id);
         let working_dir = source.working_dir.clone();
         if self.single_panel {
             let panel = cx.new(|cx| {
-                Panel::new_change_review(session_id, working_dir, request, self.bridge.clone(), cx)
+                let mut panel =
+                    Panel::new_review(session_id, working_dir, self.bridge.clone(), cx);
+                fill(&mut panel, cx);
+                panel
             });
             match panel_window::open_panel_window(
-                panel,
+                panel.clone(),
                 Some(self.slots[source_index].panel.clone()),
                 window,
                 cx,
             ) {
-                Ok(panel) => panel.update(cx, |panel, cx| panel.set_change_review(request, cx)),
+                // An existing review window is reused and needs the new content.
+                Ok(opened) if opened != panel => opened.update(cx, |panel, cx| fill(panel, cx)),
+                Ok(_) => {}
                 Err(error) => eprintln!("failed to open change review window: {error:#}"),
             }
             return;
         }
         let row = self.slots[source_index].row;
-        // Reuse the source conversation's review column, including when it has
-        // been moved, rather than opening a new column for every file click.
         let index = if let Some(index) = self
             .slots
             .iter()
@@ -79,17 +140,14 @@ impl Workspace {
         {
             self.slots[index]
                 .panel
-                .update(cx, |panel, cx| panel.set_change_review(request, cx));
+                .update(cx, |panel, cx| fill(panel, cx));
             index
         } else {
             let panel = cx.new(|cx| {
-                Panel::new_change_review(
-                    session_id.clone(),
-                    working_dir,
-                    request,
-                    self.bridge.clone(),
-                    cx,
-                )
+                let mut panel =
+                    Panel::new_review(session_id.clone(), working_dir, self.bridge.clone(), cx);
+                fill(&mut panel, cx);
+                panel
             });
             let width_fraction = DEFAULT_WIDTH;
             let index = source_index + 1;

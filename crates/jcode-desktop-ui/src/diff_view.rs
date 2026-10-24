@@ -208,6 +208,8 @@ pub(crate) struct DiffView {
     file_page: usize,
     done: bool,
     failed: bool,
+    /// Replaces the tool-call status, e.g. for live working-tree diffs.
+    label: Option<SharedString>,
     copied: Option<String>,
     counts: (usize, usize),
 }
@@ -238,9 +240,14 @@ impl DiffView {
             file_page: 0,
             done: false,
             failed: false,
+            label: None,
             copied: None,
             counts,
         }
+    }
+
+    pub(crate) fn set_label(&mut self, label: Option<SharedString>) {
+        self.label = label;
     }
 
     pub fn set_status(&mut self, done: bool, failed: bool, cx: &mut Context<Self>) {
@@ -251,13 +258,16 @@ impl DiffView {
         }
     }
 
-    fn status(&self) -> &'static str {
+    fn status(&self) -> SharedString {
+        if let Some(label) = &self.label {
+            return label.clone();
+        }
         if self.failed {
-            "Apply failed · proposed changes"
+            "Apply failed · proposed changes".into()
         } else if self.done {
-            "Completed · requested changes"
+            "Completed · requested changes".into()
         } else {
-            "Proposed changes"
+            "Proposed changes".into()
         }
     }
 

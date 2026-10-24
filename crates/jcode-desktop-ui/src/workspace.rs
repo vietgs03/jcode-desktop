@@ -8691,6 +8691,7 @@ impl Render for Workspace {
                             .flex()
                             .flex_col()
                             .pt(px(content_top_inset))
+            .on_action(cx.listener(Self::open_working_tree_changes))
                             .pl(px(connector_width))
                             .pr(px(right_margin))
                             .child(

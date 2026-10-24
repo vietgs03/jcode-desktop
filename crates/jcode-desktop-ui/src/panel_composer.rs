@@ -202,6 +202,7 @@ impl Panel {
                     .gap_1()
                     .overflow_hidden()
                     .child(meta)
+                    .children(self.render_changes_pill(screenshot_mode, cx))
                     .children(self.render_publish_button(cx))
                     .children(remote_machine.map(|machine| {
                         // Remote sessions name their machine first, so a cloud

@@ -65,6 +65,15 @@ impl OpenChangeReview {
     }
 }
 
+/// Open the live Changes review for the source panel's git working tree.
+#[derive(Clone, PartialEq, gpui::Action)]
+#[action(no_json)]
+pub(crate) struct OpenWorkingTreeChanges {
+    pub source: gpui::EntityId,
+    /// Select the first staged file, as `/changes --staged` asks.
+    pub staged: bool,
+}
+
 #[derive(Clone, PartialEq, gpui::Action)]
 #[action(no_json)]
 pub(crate) struct CloseChangeReview {

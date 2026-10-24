@@ -6,8 +6,44 @@
 
 use std::process::Command;
 
+/// Concurrent wsl.exe launches allowed process-wide, and retries after a
+/// silent interop failure. Panels, sidebar probes and the bridge share these.
+const WSL_CONCURRENCY: usize = 3;
+const WSL_RETRIES: usize = 2;
+
+mod wsl_gate {
+    use std::sync::{Condvar, Mutex};
+
+    static ACTIVE: Mutex<usize> = Mutex::new(0);
+    static FREED: Condvar = Condvar::new();
+
+    pub(super) struct Permit;
+
+    pub(super) fn acquire() -> Permit {
+        let mut active = ACTIVE.lock().unwrap_or_else(|e| e.into_inner());
+        while *active >= super::WSL_CONCURRENCY {
+            active = FREED.wait(active).unwrap_or_else(|e| e.into_inner());
+        }
+        *active += 1;
+        Permit
+    }
+
+    impl Drop for Permit {
+        fn drop(&mut self) {
+            let mut active = ACTIVE.lock().unwrap_or_else(|e| e.into_inner());
+            *active -= 1;
+            FREED.notify_one();
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn active() -> usize {
+        *ACTIVE.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}
+
 /// Where a session's checkout lives.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum Location {
     Local,
     /// A WSL distribution, `None` for the default one.
@@ -53,6 +89,32 @@ impl Location {
         command
     }
 
+    /// Run a command built by [`Location::command`]. WSL launches share a
+    /// small global gate, because many concurrent wsl.exe interop sessions
+    /// time out (`UtilAcceptVsock ... accept4 failed 110`) and exit non-zero
+    /// with no output. Such silent failures are retried after a short pause.
+    /// Real tool failures explain themselves on stderr and are never retried.
+    pub fn output(&self, command: &mut Command) -> std::io::Result<std::process::Output> {
+        if *self == Self::Local {
+            return command.output();
+        }
+        let mut attempt = 0;
+        loop {
+            let output = {
+                let _permit = wsl_gate::acquire();
+                command.output()?
+            };
+            let silent = !output.status.success()
+                && output.stdout.iter().all(u8::is_ascii_whitespace)
+                && output.stderr.iter().all(u8::is_ascii_whitespace);
+            if !silent || attempt == WSL_RETRIES {
+                return Ok(output);
+            }
+            attempt += 1;
+            std::thread::sleep(std::time::Duration::from_millis(300 * attempt as u64));
+        }
+    }
+
     /// Run git read-only with locks, pagers and colour disabled.
     pub fn git(&self, directory: &str, args: &[&str]) -> Result<String, String> {
         let mut command = self.command(directory, "git");
@@ -60,14 +122,28 @@ impl Location {
             .env("GIT_OPTIONAL_LOCKS", "0")
             .args(["--no-pager", "-c", "color.ui=false", "-c", "core.fsmonitor=false"])
             .args(args);
-        let output = command
-            .output()
+        let output = self
+            .output(&mut command)
             .map_err(|error| format!("Could not run git: {error}"))?;
         if !output.status.success() {
+            // wsl.exe reports its own failures on stdout in UTF-16, leaving
+            // stderr empty. Silent failures (git grep without matches) keep
+            // the bare `failed: ` form callers match on.
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+            let detail = if stderr.is_empty() {
+                String::from_utf8_lossy(&output.stdout)
+                    .chars()
+                    .filter(|c| *c != '\0')
+                    .take(400)
+                    .collect::<String>()
+                    .trim()
+                    .to_owned()
+            } else {
+                stderr
+            };
             return Err(format!(
-                "git {} failed: {}",
+                "git {} failed: {detail}",
                 args.first().copied().unwrap_or_default(),
-                String::from_utf8_lossy(&output.stderr).trim()
             ));
         }
         Ok(String::from_utf8_lossy(&output.stdout).into_owned())
@@ -76,11 +152,14 @@ impl Location {
     fn exists(&self, path: &str) -> bool {
         match self {
             Self::Local => std::fs::symlink_metadata(path).is_ok(),
-            Self::Wsl(_) => self
-                .command("/", "test")
-                .args(["-e", path])
-                .status()
-                .is_ok_and(|status| status.success()),
+            // A missing path is a silent non-zero exit, so gate without retry.
+            Self::Wsl(_) => {
+                let _permit = wsl_gate::acquire();
+                self.command("/", "test")
+                    .args(["-e", path])
+                    .status()
+                    .is_ok_and(|status| status.success())
+            }
         }
     }
 }
@@ -719,6 +798,35 @@ mod working_tree_tests {
         // Read-only: the index and files are unchanged.
         let after = working_tree(&Location::Local, path).unwrap();
         assert_eq!(after, tree);
+    }
+
+    /// Windows only, opt-in: a burst like several panels' Changes pills plus
+    /// sidebar probes at once. Every launch succeeds and the gate holds.
+    #[test]
+    fn wsl_parallel_git_calls_are_bounded_and_all_succeed() {
+        let Ok(repo) = std::env::var("JCODE_WSL_TEST_REPO") else {
+            return;
+        };
+        let wsl = Location::Wsl(None);
+        let peak = std::sync::atomic::AtomicUsize::new(0);
+        let started = std::time::Instant::now();
+        let results: Vec<_> = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..12)
+                .map(|_| {
+                    scope.spawn(|| {
+                        let result = wsl.git(&repo, &["diff", "--numstat"]);
+                        peak.fetch_max(wsl_gate::active(), std::sync::atomic::Ordering::Relaxed);
+                        result
+                    })
+                })
+                .collect();
+            handles.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+        eprintln!("12 parallel WSL git calls in {:?}", started.elapsed());
+        for result in &results {
+            assert!(result.as_ref().is_ok_and(|out| !out.is_empty()), "{result:?}");
+        }
+        assert!(peak.into_inner() <= WSL_CONCURRENCY);
     }
 
     /// Windows only, opt-in: `JCODE_WSL_TEST_REPO=/home/me/repo`.

@@ -436,15 +436,26 @@ impl Panel {
         bridge: Bridge,
         cx: &mut Context<Self>,
     ) -> Self {
-        let mut panel = Self::new(
+        let mut panel = Self::new_review(session_id, working_dir, bridge, cx);
+        panel.set_change_review(request, cx);
+        panel
+    }
+
+    /// An empty review column. Callers fill it with a tool review or the
+    /// live working-tree Changes review.
+    pub(crate) fn new_review(
+        session_id: String,
+        working_dir: Option<String>,
+        bridge: Bridge,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        Self::new(
             session_id,
             Some("Change review".into()),
             working_dir,
             bridge,
             cx,
-        );
-        panel.set_change_review(request, cx);
-        panel
+        )
     }
 
     pub(crate) fn set_change_review(
@@ -452,6 +463,9 @@ impl Panel {
         request: &crate::ui_actions::OpenChangeReview,
         cx: &mut Context<Self>,
     ) {
+        // A tool review replaces the live Changes review in this column.
+        self.working_tree_review = None;
+        self.title = "Change review".into();
         let output = if request.failed {
             ""
         } else {
@@ -510,6 +524,9 @@ impl Panel {
     }
 
     pub(super) fn render_diff_review(&self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
+        if self.working_tree_review.is_some() {
+            return Some(self.render_working_tree_review(cx));
+        }
         let review = self.diff_review.as_ref()?;
         let file = &review.files[review.selected];
         let theme = Theme::global();

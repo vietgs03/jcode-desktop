@@ -426,38 +426,16 @@ fn valid_session_filename(id: &str) -> bool {
 
 /// The working-tree diff as a unified patch, or `None` when there are no
 /// tracked changes. Bounded so a huge diff cannot stall the transcript.
+/// `/changes` normally opens the Changes review. This transcript card is
+/// the fallback when the command reaches the panel without a window.
 fn git_diff_patch(
     location: &jcode_desktop_harness::session_git::Location,
     directory: &str,
     staged: bool,
 ) -> Result<Option<String>, String> {
-    // Override diff.mnemonicPrefix/noprefix so paths always use a/ and b/.
-    let mut args = vec![
-        "diff",
-        "--no-ext-diff",
-        "--no-textconv",
-        "--no-color",
-        "-M",
-        "--src-prefix=a/",
-        "--dst-prefix=b/",
-    ];
-    if staged {
-        args.push("--cached");
-    }
-    let patch = location.git(directory, &args)?;
-    if patch.trim().is_empty() {
-        return Ok(None);
-    }
-    const LIMIT: usize = 2 * 1024 * 1024;
-    if patch.len() > LIMIT {
-        let mut end = LIMIT;
-        while !patch.is_char_boundary(end) {
-            end -= 1;
-        }
-        let cut = patch[..end].rfind("\ndiff --git ").map_or(end, |index| index + 1);
-        return Ok(Some(patch[..cut].to_owned()));
-    }
-    Ok(Some(patch))
+    let (patch, _truncated) =
+        jcode_desktop_harness::session_git::diff_patch(location, directory, staged)?;
+    Ok((!patch.trim().is_empty()).then_some(patch))
 }
 
 fn git_read(

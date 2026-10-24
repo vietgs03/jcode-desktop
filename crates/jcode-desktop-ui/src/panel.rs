@@ -84,6 +84,8 @@ use scroll_motion::WheelGlide;
 mod cache_miss;
 #[path = "panel_composer.rs"]
 mod composer;
+#[path = "panel_changes.rs"]
+mod changes;
 #[path = "panel_diff.rs"]
 mod diff_review;
 #[path = "panel_effort.rs"]
@@ -499,6 +501,13 @@ pub struct Panel {
     image_pane_stacked: bool,
     image_preview: Option<TranscriptImage>,
     diff_review: Option<diff_review::DiffReview>,
+    working_tree_review: Option<changes::WorkingTreeReview>,
+    changes_context: Option<(jcode_desktop_harness::session_git::Location, String)>,
+    changes_summary: Option<Result<jcode_desktop_harness::session_git::WorkingTree, String>>,
+    changes_refresh_in_flight: bool,
+    changes_refresh_pending: bool,
+    changes_refresh_timer: bool,
+    changes_last_started: Option<Instant>,
     edit_previews: diff_review::EditPreviews,
     image_preview_zoom: f32,
     image_preview_scroll: gpui::ScrollHandle,
@@ -975,6 +984,13 @@ impl Panel {
             image_pane_stacked: false,
             image_preview: None,
             diff_review: None,
+            working_tree_review: None,
+            changes_context: None,
+            changes_summary: None,
+            changes_refresh_in_flight: false,
+            changes_refresh_pending: false,
+            changes_refresh_timer: false,
+            changes_last_started: None,
             edit_previews: diff_review::EditPreviews::default(),
             image_preview_zoom: 1.0,
             image_preview_scroll: gpui::ScrollHandle::new(),
@@ -1788,6 +1804,22 @@ impl Panel {
                         }
                         if images.is_empty() && crate::commands::is_resume_command(&content) {
                             _window.dispatch_action(Box::new(crate::ui_actions::OpenResume), app);
+                            return;
+                        }
+                        // `/changes` opens the live Changes review when Desktop can
+                        // reach the checkout. Otherwise the command explains why.
+                        if images.is_empty()
+                            && let Some(staged) = changes::changes_command(&content)
+                            && let Some(panel) = weak.upgrade()
+                            && panel.read(app).git_changes_context().is_some()
+                        {
+                            _window.dispatch_action(
+                                Box::new(crate::ui_actions::OpenWorkingTreeChanges {
+                                    source: panel.entity_id(),
+                                    staged,
+                                }),
+                                app,
+                            );
                             return;
                         }
                         // First-run launch is local, including before a session connects.
@@ -2969,6 +3001,7 @@ impl Panel {
             ApiEvent::TurnDone { .. } => {
                 self.reconcile_reconnect_response();
                 self.finish_response();
+                self.refresh_changes_after_turn(cx);
             }
             ApiEvent::TurnStopped {
                 reason,
@@ -4305,7 +4338,11 @@ impl Panel {
         if let Some(handle) = self.document_focus_handle(cx) {
             return handle;
         }
-        if self.image_preview.is_some() || self.diff_review.is_some() || self.is_accounts_panel() {
+        if self.image_preview.is_some()
+            || self.diff_review.is_some()
+            || self.working_tree_review.is_some()
+            || self.is_accounts_panel()
+        {
             self.focus_handle.clone()
         } else if let Some(terminal) = &self.terminal {
             terminal.read(cx).focus_handle(cx)
@@ -5156,7 +5193,9 @@ impl Render for Panel {
                     this.focus_input(window, cx);
                     cx.notify();
                     cx.stop_propagation();
-                } else if this.diff_review.is_some() && event.keystroke.key == "escape" {
+                } else if (this.diff_review.is_some() || this.working_tree_review.is_some())
+                    && event.keystroke.key == "escape"
+                {
                     this.close_diff_review(window, cx);
                     cx.stop_propagation();
                 } else if this.image_preview.is_some() && event.keystroke.key == "escape" {
@@ -5250,7 +5289,9 @@ impl Render for Panel {
                                             cx.stop_propagation();
                                             return;
                                         }
-                                        if panel.diff_review.is_some() {
+                                        if panel.diff_review.is_some()
+                                            || panel.working_tree_review.is_some()
+                                        {
                                             return;
                                         }
                                         if panel.startup_layout.is_some()
