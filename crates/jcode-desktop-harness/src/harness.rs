@@ -1802,21 +1802,49 @@ fn merge_wsl_sessions(sessions: &mut Vec<SessionInfo>) {
         return;
     };
     let started = std::time::Instant::now();
-    let options = jcode_sdk::SshConnectOptions {
-        client_name: format!("jcode-desktop-wsl-sessions/{}", crate::client_version()),
-        connect_timeout: Duration::from_secs(20),
-        request_timeout: Some(Duration::from_secs(30)),
-        ..jcode_sdk::SshConnectOptions::new(&host)
-    };
-    let remote_sessions = match JcodeClient::connect_ssh(options)
-        .and_then(|client| client.list_sessions_limited(MAX_PERSISTED_SIDEBAR_SESSIONS as u32))
+    // Every refresh used to start `wsl.exe` and a fresh `jcode api --stdio`
+    // bridge, which costs seconds on its own and often hit the 20-second
+    // startup timeout while WSL was busy. Keep one connection for the list
+    // and start another only after it fails.
+    static CLIENT: std::sync::Mutex<Option<(String, JcodeClient)>> = std::sync::Mutex::new(None);
+    let mut cached = CLIENT
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if cached
+        .as_ref()
+        .is_some_and(|(cached_host, client)| *cached_host != host || client.is_closed())
     {
+        *cached = None;
+    }
+    let reused = cached.is_some();
+    if cached.is_none() {
+        let options = jcode_sdk::SshConnectOptions {
+            client_name: format!("jcode-desktop-wsl-sessions/{}", crate::client_version()),
+            connect_timeout: Duration::from_secs(20),
+            request_timeout: Some(Duration::from_secs(30)),
+            ..jcode_sdk::SshConnectOptions::new(&host)
+        };
+        match JcodeClient::connect_ssh(options) {
+            Ok(client) => *cached = Some((host.clone(), client)),
+            Err(error) => {
+                eprintln!("jcode desktop: {host} session list failed: {error}");
+                return;
+            }
+        }
+    }
+    let listed = cached
+        .as_ref()
+        .map(|(_, client)| client.list_sessions_limited(MAX_PERSISTED_SIDEBAR_SESSIONS as u32))
+        .expect("connected above");
+    let remote_sessions = match listed {
         Ok(list) => list,
         Err(error) => {
-            eprintln!("jcode desktop: {host} session list failed: {error}");
+            *cached = None;
+            eprintln!("jcode desktop: {host} session list failed (reused={reused}): {error}");
             return;
         }
     };
+    drop(cached);
     let mut wsl = remote_sessions
         .into_iter()
         .filter(|session| !session.archived)
@@ -1834,7 +1862,7 @@ fn merge_wsl_sessions(sessions: &mut Vec<SessionInfo>) {
         })
         .collect::<Vec<_>>();
     eprintln!(
-        "jcode desktop: {host} session list completed in {:.1}ms ({} sessions)",
+        "jcode desktop: {host} session list completed in {:.1}ms ({} sessions, reused={reused})",
         started.elapsed().as_secs_f64() * 1_000.0,
         wsl.len()
     );
@@ -4237,3 +4265,37 @@ mod stop_reason_routing_tests {
 #[cfg(all(test, unix))]
 #[path = "harness_transport_integration_tests.rs"]
 mod transport_integration_tests;
+
+/// What reusing the WSL list connection saves. Needs a WSL distribution with
+/// `jcode` on PATH: `wsl_list_connection_reuse_timing -- --ignored --nocapture`.
+#[cfg(all(test, windows))]
+#[test]
+#[ignore = "manual timing against the real WSL daemon"]
+fn wsl_list_connection_reuse_timing() {
+    let connect = || {
+        JcodeClient::connect_ssh(jcode_sdk::SshConnectOptions {
+            client_name: "jcode-desktop-wsl-sessions/timing".into(),
+            connect_timeout: Duration::from_secs(60),
+            request_timeout: Some(Duration::from_secs(60)),
+            ..jcode_sdk::SshConnectOptions::new("wsl")
+        })
+        .expect("connect to WSL")
+    };
+    let mut fresh = Vec::new();
+    for _ in 0..3 {
+        let started = std::time::Instant::now();
+        let client = connect();
+        client.list_sessions_limited(100).expect("list");
+        fresh.push(started.elapsed());
+    }
+    let client = connect();
+    client.list_sessions_limited(100).expect("warm");
+    let mut reused = Vec::new();
+    for _ in 0..3 {
+        let started = std::time::Instant::now();
+        client.list_sessions_limited(100).expect("list");
+        reused.push(started.elapsed());
+    }
+    println!("WSL_LIST fresh={fresh:?} reused={reused:?}");
+    assert!(reused.iter().max() < fresh.iter().min());
+}
