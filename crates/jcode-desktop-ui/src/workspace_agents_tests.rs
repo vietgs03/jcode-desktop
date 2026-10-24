@@ -183,11 +183,27 @@ fn setup(
             cx,
         );
         w.apply(Update::SwarmState { roster: roster() }, cx);
+        // Start folded: these tests drive the fold explicitly.
+        w.agents_collapsed.insert(LEAD.into());
         cx.notify();
     });
     vcx.run_until_parked();
     while commands.try_recv().is_ok() {}
     (workspace, vcx, commands)
+}
+
+#[gpui::test]
+fn agents_board_unfolds_by_default_while_agents_work(cx: &mut gpui::TestAppContext) {
+    let (workspace, vcx, _commands) = setup(cx);
+    workspace.update(vcx, |w, cx| {
+        w.agents_collapsed.clear();
+        cx.notify();
+    });
+    vcx.run_until_parked();
+    assert!(shown(vcx, "agents-board"), "working agents unfold the board");
+    click(vcx, "agents-strip");
+    assert!(!shown(vcx, "agents-board"), "the user's fold sticks");
+    workspace.read_with(vcx, |w, _| assert!(w.agents_collapsed.contains(LEAD)));
 }
 
 fn shown(vcx: &mut gpui::VisualTestContext, selector: &str) -> bool {

@@ -424,6 +424,14 @@ impl Workspace {
         Index::new(&self.swarm_roster, &self.sessions).board(session_id)
     }
 
+    /// Unfolded when the user asked for it, or by default while any agent
+    /// is working (unless the user folded it).
+    pub(super) fn agents_board_expanded(&self, session_id: &str, board: &AgentsBoard) -> bool {
+        self.agents_expanded.contains(session_id)
+            || (!self.agents_collapsed.contains(session_id)
+                && (board.count(AgentState::Working) + board.count(AgentState::Starting)) > 0)
+    }
+
     /// Open (or focus) an agent's conversation, reusing a mounted panel.
     pub(super) fn open_agent(
         &mut self,
@@ -468,6 +476,7 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         self.agents_expanded.insert(session_id.to_owned());
+        self.agents_collapsed.remove(session_id);
         self.open_agent(session_id, window, cx);
     }
 
@@ -498,7 +507,7 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
         let theme = Theme::global();
-        let expanded = self.agents_expanded.contains(session_id);
+        let expanded = self.agents_board_expanded(session_id, board);
         let toggle_id = session_id.to_owned();
         let summary = board.summary();
         let now_ms = u64::try_from(unix_now_ms()).unwrap_or_default();
@@ -525,7 +534,12 @@ impl Workspace {
                 gpui::MouseButton::Left,
                 cx.listener(move |this, _, _, cx| {
                     cx.stop_propagation();
-                    if !this.agents_expanded.remove(&toggle_id) {
+                    let board = this.agents_board(&toggle_id);
+                    if this.agents_board_expanded(&toggle_id, &board) {
+                        this.agents_expanded.remove(&toggle_id);
+                        this.agents_collapsed.insert(toggle_id.clone());
+                    } else {
+                        this.agents_collapsed.remove(&toggle_id);
                         this.agents_expanded.insert(toggle_id.clone());
                     }
                     cx.notify();

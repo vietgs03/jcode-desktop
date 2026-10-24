@@ -230,6 +230,7 @@ impl Workspace {
                 source.update(cx, |panel, cx| panel.workspace_command_notice(message, cx))
             }
             WorkspaceCommand::Worktree(branch) => self.slash_worktree(source, branch, cx),
+            WorkspaceCommand::Swarms => self.open_swarm_view(cx),
         }
     }
 

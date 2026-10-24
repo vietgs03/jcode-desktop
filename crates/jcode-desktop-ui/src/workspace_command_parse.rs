@@ -18,6 +18,7 @@ pub(crate) enum WorkspaceCommand {
     Transfer,
     Publish,
     Worktree(String),
+    Swarms,
     Invalid(&'static str),
 }
 
@@ -46,6 +47,7 @@ pub(crate) fn parse(content: &str) -> Option<WorkspaceCommand> {
         "/server-reload" => Invalid("Usage: /server-reload"),
         "/selfdev" => Selfdev(tail.into()),
         "/worktree" | "/wt" => Worktree(tail.into()),
+        "/swarms" | "/agents" if tail.is_empty() => Swarms,
         "/back" if tail.is_empty() => Back,
         "/workspace" if tail.is_empty() => Workspace,
         "/quit" if tail.is_empty() => Quit,

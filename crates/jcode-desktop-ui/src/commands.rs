@@ -67,6 +67,11 @@ pub(crate) const REGISTERED_COMMANDS: &[RegisteredCommand] = &[
         "/worktree",
         "Start a branch in its own isolated checkout and open a chat there",
     ),
+    RegisteredCommand::public(
+        "/swarms",
+        "Open the Swarm view: every recent swarm and what each agent is doing",
+    ),
+    RegisteredCommand::hidden("/agents", "Alias for /swarms"),
     RegisteredCommand::public("/colors", "List or change Desktop color themes"),
     RegisteredCommand::hidden("/color", "Alias for /colors"),
     RegisteredCommand::public("/hotkeys", "List registered Desktop hotkeys and contexts"),

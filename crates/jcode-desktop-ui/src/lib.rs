@@ -155,6 +155,9 @@ pub fn bind_workspace_keys(cx: &mut App) {
         KeyBinding::new("super-shift-g", OpenGmail, None),
         KeyBinding::new("super-shift-d", OpenTodoist, None),
         KeyBinding::new("super-shift-a", OpenOrchestration, None),
+        KeyBinding::new("super-shift-w", workspace::ToggleSwarmView, None),
+        // Windows reserves many Super chords; Ctrl+Alt+S works everywhere.
+        KeyBinding::new("ctrl-alt-s", workspace::ToggleSwarmView, None),
         // Enter and ; use the configured fixed favorite. ' explicitly uses
         // home. Super+T remains the terminal shortcut.
         #[cfg(not(target_os = "macos"))]

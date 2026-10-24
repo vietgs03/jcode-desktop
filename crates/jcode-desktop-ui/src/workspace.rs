@@ -66,6 +66,8 @@ mod sidebar_selection;
 mod sidebar_swarm;
 #[path = "workspace_agents.rs"]
 mod agents;
+#[path = "workspace_swarm_view.rs"]
+mod swarm_view;
 #[path = "sidebar_worktrees.rs"]
 mod sidebar_worktrees;
 #[path = "workspace_terminal.rs"]
@@ -194,6 +196,7 @@ actions!(
         NewUnfinishedWork,
         OpenFolder,
         ToggleOverview,
+        ToggleSwarmView,
         ToggleHints,
         ToggleShowcase,
         ToggleSidebar,
@@ -822,6 +825,10 @@ pub struct Workspace {
     swarm_roster: harness::swarm_state::Roster,
     /// Coordinators whose Agents board is unfolded.
     agents_expanded: HashSet<String>,
+    /// Coordinators whose board the user folded while agents were working.
+    agents_collapsed: HashSet<String>,
+    /// The workspace Swarm view, when open.
+    swarm_view: Option<swarm_view::SwarmViewState>,
     /// Never rerank an established shortcut, including after session refreshes.
     pinned_working_dir: Option<String>,
     /// Configured logins and API keys, refreshed in the background.
@@ -1144,6 +1151,8 @@ impl Workspace {
             daemon_running: HashMap::new(),
             swarm_roster: Default::default(),
             agents_expanded: HashSet::new(),
+            agents_collapsed: HashSet::new(),
+            swarm_view: None,
             pinned_working_dir: crate::config::get().workspace.pinned_working_dir.clone(),
             remotes: remotes::Machines::from_config(),
             accounts: Vec::new(),
@@ -1532,6 +1541,8 @@ impl Workspace {
             daemon_running: HashMap::new(),
             swarm_roster: Default::default(),
             agents_expanded: HashSet::new(),
+            agents_collapsed: HashSet::new(),
+            swarm_view: None,
             pinned_working_dir: None,
             remotes: remotes::Machines::default(),
             accounts: Vec::new(),
@@ -5954,6 +5965,7 @@ impl Workspace {
             .overflow_hidden();
         list = list.flex().flex_col();
         list = list.child(self.render_sidebar_quick_actions(cx));
+        list = list.child(self.render_sidebar_swarms_entry(cx));
         if let Some(applets) = self.sidebar_applets.take() {
             list = list.child(applets);
         }
@@ -8627,7 +8639,9 @@ impl Render for Workspace {
         }
 
         self.advance_hidden_strip_animations(now, overview_progress > 0.0);
-        let content = if overview_progress > 0.0 {
+        let content = if self.swarm_view.is_some() {
+            self.render_swarm_view(cx)
+        } else if overview_progress > 0.0 {
             div()
                 .size_full()
                 .bg(Theme::global().BG)
@@ -8760,6 +8774,11 @@ impl Render for Workspace {
                     this.focus_active(window, cx);
                     cx.stop_propagation();
                     cx.notify();
+                    return;
+                }
+                if this.swarm_view.is_some() && event.keystroke.key == "escape" {
+                    this.close_swarm_view(window, cx);
+                    cx.stop_propagation();
                 }
             }))
             // Navigation belongs to the canvas, regardless of which control in
@@ -8803,6 +8822,7 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::open_folder))
             .on_action(cx.listener(Self::close_panel))
             .on_action(cx.listener(Self::toggle_overview))
+            .on_action(cx.listener(Self::toggle_swarm_view))
             .capture_action(cx.listener(Self::toggle_onboarding_simulator))
             .on_action(cx.listener(Self::toggle_hints))
             .on_action(cx.listener(Self::toggle_showcase))
