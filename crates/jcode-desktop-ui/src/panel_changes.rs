@@ -24,24 +24,26 @@ pub(super) fn changes_command(content: &str) -> Option<bool> {
 }
 
 #[derive(Clone)]
-enum ChangesRow {
+pub(super) enum ChangesRow {
     Group(Area, usize),
     File(usize),
 }
 
 pub(super) struct WorkingTreeReview {
-    location: Location,
-    directory: String,
-    tree: Option<WorkingTree>,
-    rows: Vec<ChangesRow>,
-    list: ListState,
-    content: Option<crate::diff_review_content::ReviewContent>,
-    selected: usize,
-    prefer_staged: bool,
-    loading: bool,
-    refresh_pending: bool,
-    error: Option<String>,
-    truncated: bool,
+    pub(super) location: Location,
+    pub(super) directory: String,
+    pub(super) tree: Option<WorkingTree>,
+    pub(super) rows: Vec<ChangesRow>,
+    pub(super) list: ListState,
+    pub(super) content: Option<crate::review_stack::StackedDiff>,
+    pub(super) selected: usize,
+    pub(super) prefer_staged: bool,
+    pub(super) loading: bool,
+    pub(super) refresh_pending: bool,
+    pub(super) error: Option<String>,
+    pub(super) truncated: bool,
+    /// Scopes, tabs, agent turns and history of the Review pane.
+    pub(super) pane: super::review_pane::PaneState,
 }
 
 struct ReviewSnapshot {
@@ -50,7 +52,7 @@ struct ReviewSnapshot {
     truncated: bool,
 }
 
-struct ChangesTooltip(String);
+pub(super) struct ChangesTooltip(pub(super) String);
 
 impl Render for ChangesTooltip {
     fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
@@ -66,7 +68,7 @@ impl Render for ChangesTooltip {
     }
 }
 
-fn status_kind(status: char) -> &'static str {
+pub(super) fn status_kind(status: char) -> &'static str {
     match status {
         '?' | 'A' => "Added",
         'D' => "Deleted",
@@ -76,7 +78,7 @@ fn status_kind(status: char) -> &'static str {
     }
 }
 
-fn status_color(status: char) -> gpui::Rgba {
+pub(super) fn status_color(status: char) -> gpui::Rgba {
     let theme = Theme::global();
     match status {
         '?' | 'A' => theme.OK,
@@ -86,7 +88,7 @@ fn status_color(status: char) -> gpui::Rgba {
     }
 }
 
-fn unique_file_count(tree: &WorkingTree) -> usize {
+pub(super) fn unique_file_count(tree: &WorkingTree) -> usize {
     tree.files
         .iter()
         .map(|file| file.path.as_str())
@@ -94,7 +96,7 @@ fn unique_file_count(tree: &WorkingTree) -> usize {
         .len()
 }
 
-fn branch_label(tree: &WorkingTree) -> String {
+pub(super) fn branch_label(tree: &WorkingTree) -> String {
     let mut label = tree
         .branch
         .head
@@ -110,7 +112,7 @@ fn branch_label(tree: &WorkingTree) -> String {
     label
 }
 
-fn summary_label(tree: &WorkingTree) -> String {
+pub(super) fn summary_label(tree: &WorkingTree) -> String {
     let (added, removed) = tree.totals();
     format!(
         "{} · {} file{} · +{} −{} · {} staged · {} unstaged · {} untracked",
@@ -208,7 +210,7 @@ fn review_snapshot(mut tree: WorkingTree, patches: WorkingTreePatches) -> Review
 
 impl Panel {
     /// Where this conversation's checkout lives, for local and WSL sessions.
-    pub(super) fn git_changes_context(&self) -> Option<(Location, String)> {
+    pub(crate) fn git_changes_context(&self) -> Option<(Location, String)> {
         if self.is_change_review()
             || self.is_accounts_panel()
             || self.is_changelog()
@@ -394,14 +396,16 @@ impl Panel {
                 refresh_pending: false,
                 error: None,
                 truncated: false,
+                pane: super::review_pane::PaneState::new(),
             });
+            self.load_review_branches(cx);
         } else if let Some(review) = &mut self.working_tree_review {
             review.prefer_staged |= prefer_staged;
         }
         self.refresh_working_tree_review(cx);
     }
 
-    fn refresh_working_tree_review(&mut self, cx: &mut Context<Self>) {
+    pub(super) fn refresh_working_tree_review(&mut self, cx: &mut Context<Self>) {
         let Some(review) = &mut self.working_tree_review else {
             return;
         };
@@ -452,15 +456,18 @@ impl Panel {
                                 })
                                 .unwrap_or(0)
                         };
+                        let split = current.pane.split;
+                        let attach = current.pane.attach.clone();
                         let content = (!snapshot.preview.files.is_empty()).then(|| {
-                            crate::diff_review_content::ReviewContent::with_label(
+                            let mut stack = crate::review_stack::StackedDiff::new(
                                 snapshot.preview,
-                                selected,
-                                true,
-                                false,
                                 Some("Working tree".into()),
+                                split,
+                                attach,
                                 cx,
-                            )
+                            );
+                            stack.select(selected);
+                            stack
                         });
                         let rows = grouped_rows(&snapshot.tree);
                         (
@@ -494,7 +501,7 @@ impl Panel {
         .detach();
     }
 
-    fn select_working_tree_file(&mut self, index: usize, cx: &mut Context<Self>) {
+    pub(super) fn select_working_tree_file(&mut self, index: usize, cx: &mut Context<Self>) {
         let Some(review) = &mut self.working_tree_review else {
             return;
         };
@@ -506,434 +513,9 @@ impl Panel {
         }
         review.selected = index;
         if let Some(content) = &mut review.content {
-            content.select(index, cx);
+            content.select(index);
         }
         cx.notify();
-    }
-
-    fn render_changes_row(
-        &self,
-        row_index: usize,
-        panel: gpui::WeakEntity<Self>,
-    ) -> gpui::AnyElement {
-        let theme = Theme::global();
-        let Some(review) = &self.working_tree_review else {
-            return div().into_any_element();
-        };
-        let Some(row) = review.rows.get(row_index) else {
-            return div().into_any_element();
-        };
-        match *row {
-            ChangesRow::Group(area, count) => div()
-                .h(px(34.))
-                .px_3()
-                .pt_2()
-                .flex()
-                .items_center()
-                .gap_2()
-                .text_size(px(11.))
-                .font_weight(FontWeight::SEMIBOLD)
-                .text_color(theme.TEXT_DIM)
-                .child(area.label())
-                .child(
-                    div()
-                        .rounded_full()
-                        .px_1p5()
-                        .bg(theme.QUOTE_BG)
-                        .text_size(px(10.))
-                        .text_color(theme.TEXT_FAINT)
-                        .child(count.to_string()),
-                )
-                .into_any_element(),
-            ChangesRow::File(index) => {
-                let Some(tree) = &review.tree else {
-                    return div().into_any_element();
-                };
-                let Some(file) = tree.files.get(index) else {
-                    return div().into_any_element();
-                };
-                let selected = review.selected == index;
-                let max = (file.added + file.removed).max(1) as f32;
-                let add_fraction = file.added as f32 / max;
-                let remove_fraction = file.removed as f32 / max;
-                let path = file.path.clone();
-                let previous = file.previous_path.clone();
-                let status = file.status.to_string();
-                div()
-                    .id(("changes-file", index))
-                    .debug_selector(move || format!("changes-file-{index}").into())
-                    .mx_1()
-                    .h(px(if previous.is_some() { 42. } else { 36. }))
-                    .px_2()
-                    .rounded_md()
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .cursor_pointer()
-                    .when(selected, |el| el.bg(theme.ACCENT_DIM))
-                    .when(!selected, |el| el.hover(|el| el.bg(theme.QUOTE_BG)))
-                    .child(
-                        div()
-                            .w(px(12.))
-                            .flex_none()
-                            .font_family(theme.FONT_MONO)
-                            .text_size(px(11.))
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(status_color(file.status))
-                            .child(status),
-                    )
-                    .child(
-                        div()
-                            .min_w_0()
-                            .flex_1()
-                            .flex()
-                            .flex_col()
-                            .child(
-                                div()
-                                    .truncate()
-                                    .font_family(theme.FONT_MONO)
-                                    .text_size(px(11.))
-                                    .text_color(if selected {
-                                        theme.TEXT
-                                    } else {
-                                        theme.CODE_TEXT
-                                    })
-                                    .child(path),
-                            )
-                            .children(previous.map(|old| {
-                                div()
-                                    .truncate()
-                                    .font_family(theme.FONT_MONO)
-                                    .text_size(px(9.))
-                                    .text_color(theme.TEXT_FAINT)
-                                    .child(format!("from {old}"))
-                            })),
-                    )
-                    .child(
-                        div()
-                            .w(px(54.))
-                            .flex_none()
-                            .flex()
-                            .flex_col()
-                            .gap_1()
-                            .child(
-                                div()
-                                    .w_full()
-                                    .h(px(4.))
-                                    .rounded_full()
-                                    .overflow_hidden()
-                                    .flex()
-                                    .bg(theme.QUOTE_BG)
-                                    .when(add_fraction > 0., |el| {
-                                        el.child(
-                                            div()
-                                                .h_full()
-                                                .w(relative(add_fraction))
-                                                .bg(theme.OK),
-                                        )
-                                    })
-                                    .when(remove_fraction > 0., |el| {
-                                        el.child(
-                                            div()
-                                                .h_full()
-                                                .w(relative(remove_fraction))
-                                                .bg(theme.ERROR),
-                                        )
-                                    }),
-                            )
-                            .child(
-                                div()
-                                    .flex()
-                                    .justify_end()
-                                    .gap_1()
-                                    .font_family(theme.FONT_MONO)
-                                    .text_size(px(9.))
-                                    .child(
-                                        div()
-                                            .text_color(theme.OK)
-                                            .child(format!("+{}", file.added)),
-                                    )
-                                    .child(
-                                        div()
-                                            .text_color(theme.ERROR)
-                                            .child(format!("−{}", file.removed)),
-                                    ),
-                            ),
-                    )
-                    .on_click(move |_, _, cx| {
-                        let _ = panel.update(cx, |panel, cx| {
-                            panel.select_working_tree_file(index, cx)
-                        });
-                    })
-                    .into_any_element()
-            }
-        }
-    }
-
-    pub(super) fn render_working_tree_review(
-        &self,
-        cx: &mut Context<Self>,
-    ) -> gpui::AnyElement {
-        let theme = Theme::global();
-        let review = self
-            .working_tree_review
-            .as_ref()
-            .expect("working-tree review checked by caller");
-        let tree = review.tree.as_ref();
-        let summary = tree.map(summary_label);
-        let file_count = tree.map(unique_file_count).unwrap_or(0);
-        let panel = cx.entity().downgrade();
-        let list_panel = panel.clone();
-        let file_list = list(review.list.clone(), move |index, _, cx| {
-            let Some(panel) = list_panel.upgrade() else {
-                return div().into_any_element();
-            };
-            panel
-                .read(cx)
-                .render_changes_row(index, list_panel.clone())
-        })
-        .size_full();
-        let content = review.content.as_ref().map(|content| content.render());
-        let loading = review.loading;
-        let error = review.error.clone();
-        let placeholder = content.is_none() && error.is_none();
-        let clean = tree.is_some_and(WorkingTree::is_clean);
-        let truncated = review.truncated;
-        let directory = crate::platform_dirs::tilde(&review.directory);
-        div()
-            .id("working-tree-review")
-            .debug_selector(|| "working-tree-review".into())
-            .absolute()
-            .inset_0()
-            .size_full()
-            .flex()
-            .flex_col()
-            .bg(theme.PANEL_BG)
-            .occlude()
-            .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| cx.stop_propagation())
-            .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
-            .child(
-                div()
-                    .flex_none()
-                    .flex()
-                    .items_center()
-                    .gap_3()
-                    .p_3()
-                    .border_b_1()
-                    .border_color(theme.CODE_BORDER)
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .flex()
-                            .flex_col()
-                            .gap_1()
-                            .child(
-                                div()
-                                    .flex()
-                                    .items_center()
-                                    .gap_2()
-                                    .child(
-                                        div()
-                                            .text_size(px(14.))
-                                            .font_weight(FontWeight::SEMIBOLD)
-                                            .text_color(theme.TEXT)
-                                            .child("Changes"),
-                                    )
-                                    .when(loading, |el| {
-                                        el.child(
-                                            div()
-                                                .text_size(px(10.))
-                                                .text_color(theme.ACCENT)
-                                                .child("Refreshing…"),
-                                        )
-                                    }),
-                            )
-                            .child(
-                                div()
-                                    .truncate()
-                                    .text_size(px(10.))
-                                    .font_family(theme.FONT_MONO)
-                                    .text_color(theme.TEXT_DIM)
-                                    .child(summary.unwrap_or(directory)),
-                            ),
-                    )
-                    .child(
-                        div()
-                            .id("changes-refresh")
-                            .debug_selector(|| "changes-refresh".into())
-                            .px_2()
-                            .py_1()
-                            .rounded_md()
-                            .text_size(px(11.))
-                            .text_color(theme.ACCENT)
-                            .cursor_pointer()
-                            .hover(|el| el.bg(theme.QUOTE_BG))
-                            .child("Refresh")
-                            .on_click(cx.listener(|panel, _, _, cx| {
-                                panel.refresh_working_tree_review(cx);
-                                cx.stop_propagation();
-                            })),
-                    )
-                    .child(
-                        div()
-                            .id("diff-close")
-                            .debug_selector(|| "diff-close".into())
-                            .px_2()
-                            .py_1()
-                            .rounded_md()
-                            .text_size(px(11.))
-                            .text_color(theme.TEXT_DIM)
-                            .cursor_pointer()
-                            .hover(|el| el.bg(theme.QUOTE_BG))
-                            .child("Close review · Esc")
-                            .on_mouse_down(
-                                gpui::MouseButton::Left,
-                                cx.listener(|panel, _, window, cx| {
-                                    panel.close_diff_review(window, cx);
-                                    cx.stop_propagation();
-                                }),
-                            ),
-                    ),
-            )
-            .child(
-                div()
-                    .flex_1()
-                    .min_h_0()
-                    .flex()
-                    .child(
-                        div()
-                            .debug_selector(|| "changes-file-list".into())
-                            .w(relative(0.32))
-                            .min_w(px(220.))
-                            .max_w(px(420.))
-                            .flex_none()
-                            .flex()
-                            .flex_col()
-                            .m_2()
-                            .mr_0()
-                            .rounded_xl()
-                            .border_1()
-                            .border_color(theme.CODE_BORDER)
-                            .bg(theme.CODE_BG)
-                            .overflow_hidden()
-                            .child(
-                                div()
-                                    .flex_none()
-                                    .flex()
-                                    .items_center()
-                                    .gap_2()
-                                    .px_3()
-                                    .py_2()
-                                    .border_b_1()
-                                    .border_color(theme.CODE_BORDER)
-                                    .child(
-                                        div()
-                                            .text_size(px(12.))
-                                            .font_weight(FontWeight::SEMIBOLD)
-                                            .text_color(theme.TEXT)
-                                            .child("Working tree"),
-                                    )
-                                    .child(
-                                        div()
-                                            .text_size(px(11.))
-                                            .text_color(theme.TEXT_FAINT)
-                                            .child(file_count.to_string()),
-                                    ),
-                            )
-                            .child(
-                                div()
-                                    .flex_1()
-                                    .min_h_0()
-                                    .relative()
-                                    .when(review.rows.is_empty(), |el| {
-                                        el.child(
-                                            div()
-                                                .p_4()
-                                                .text_size(px(11.))
-                                                .text_color(theme.TEXT_DIM)
-                                                .child(if loading {
-                                                    "Reading repository…"
-                                                } else if clean {
-                                                    "Working tree is clean."
-                                                } else {
-                                                    "No changed files."
-                                                }),
-                                        )
-                                    })
-                                    .when(!review.rows.is_empty(), |el| {
-                                        el.child(file_list).child(crate::scrollbar::vertical_list(
-                                            &review.list,
-                                            "changes-file-scrollbar",
-                                        ))
-                                    }),
-                            ),
-                    )
-                    .child(
-                        div()
-                            .min_w_0()
-                            .flex_1()
-                            .flex()
-                            .flex_col()
-                            .m_2()
-                            .rounded_xl()
-                            .border_1()
-                            .border_color(theme.CODE_BORDER)
-                            .bg(theme.CODE_BG)
-                            .overflow_hidden()
-                            .child(
-                                div()
-                                    .flex_1()
-                                    .min_h_0()
-                                    .relative()
-                                    .when_some(content, |el, content| el.child(content))
-                                    .when_some(error, |el, error| {
-                                        el.child(
-                                            div()
-                                                .p_4()
-                                                .text_size(px(12.))
-                                                .text_color(theme.ERROR)
-                                                .child(error),
-                                        )
-                                    })
-                                    .when(placeholder, |el| {
-                                        el.child(
-                                            div()
-                                                .p_4()
-                                                .text_size(px(12.))
-                                                .text_color(theme.TEXT_DIM)
-                                                .child(if loading {
-                                                    "Loading diff…"
-                                                } else if clean {
-                                                    "No changes to review."
-                                                } else {
-                                                    "Select a file to review."
-                                                }),
-                                        )
-                                    }),
-                            )
-                            .child(
-                                div()
-                                    .flex_none()
-                                    .px_3()
-                                    .py_2()
-                                    .border_t_1()
-                                    .border_color(theme.CODE_BORDER)
-                                    .text_size(px(10.))
-                                    .text_color(if truncated {
-                                        theme.WARN
-                                    } else {
-                                        theme.TEXT_FAINT
-                                    })
-                                    .child(if truncated {
-                                        "Live working-tree snapshot · some large content was omitted · Refresh to update"
-                                    } else {
-                                        "Live working-tree snapshot · Refresh to update"
-                                    }),
-                            ),
-                    ),
-            )
-            .into_any_element()
     }
 }
 

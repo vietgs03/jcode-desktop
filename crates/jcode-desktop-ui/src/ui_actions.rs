@@ -74,6 +74,13 @@ pub(crate) struct OpenWorkingTreeChanges {
     pub staged: bool,
 }
 
+/// Maximize the Review pane to the workspace width, or restore it.
+#[derive(Clone, PartialEq, gpui::Action)]
+#[action(no_json)]
+pub(crate) struct ToggleReviewMaximize {
+    pub panel: gpui::EntityId,
+}
+
 #[derive(Clone, PartialEq, gpui::Action)]
 #[action(no_json)]
 pub(crate) struct CloseChangeReview {
@@ -88,6 +95,7 @@ gpui::actions!(
         ToggleOnboardingSimulator,
         OpenChangelog,
         OpenResume,
+        OpenReviewPane,
     ]
 );
 

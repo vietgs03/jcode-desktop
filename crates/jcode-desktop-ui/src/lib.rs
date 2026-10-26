@@ -13,6 +13,8 @@ mod commands;
 mod diff_block;
 mod diff_review_content;
 mod diff_view;
+mod review_stack;
+mod review_turns;
 mod effort;
 mod example_prompts;
 mod fps_counter;
@@ -158,6 +160,9 @@ pub fn bind_workspace_keys(cx: &mut App) {
         KeyBinding::new("super-shift-w", workspace::ToggleSwarmView, None),
         // Windows reserves many Super chords; Ctrl+Alt+S works everywhere.
         KeyBinding::new("ctrl-alt-s", workspace::ToggleSwarmView, None),
+        // Review pane beside the active conversation, and its maximize toggle.
+        KeyBinding::new("ctrl-alt-g", crate::ui_actions::OpenReviewPane, None),
+        KeyBinding::new("ctrl-shift-enter", workspace::ToggleReviewMaximizeActive, None),
         // Enter and ; use the configured fixed favorite. ' explicitly uses
         // home. Super+T remains the terminal shortcut.
         #[cfg(not(target_os = "macos"))]

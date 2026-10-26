@@ -1,7 +1,24 @@
 //! Read-only tool snapshots live beside their originating conversation.
 use super::*;
 
-pub(crate) use crate::ui_actions::{CloseChangeReview, OpenChangeReview, OpenWorkingTreeChanges};
+pub(crate) use crate::ui_actions::{
+    CloseChangeReview, OpenChangeReview, OpenReviewPane, OpenWorkingTreeChanges,
+    ToggleReviewMaximize,
+};
+
+/// Append a fenced diff to a conversation's composer draft.
+pub(crate) fn attach_to_composer(source: &Entity<Panel>, text: &str, cx: &mut App) {
+    source.update(cx, |panel, cx| {
+        panel.input.update(cx, |input, cx| {
+            let mut draft = input.content.to_string();
+            if !draft.is_empty() && !draft.ends_with('\n') {
+                draft.push('\n');
+            }
+            draft.push_str(text);
+            input.set_content(draft, cx);
+        });
+    });
+}
 
 impl Workspace {
     pub(super) fn close_change_review(
@@ -89,14 +106,111 @@ impl Workspace {
             return;
         };
         let staged = request.staged;
+        let source = self.slots[source_index].panel.downgrade();
         self.open_review_column(
             source_index,
             move |panel, cx| {
-                panel.set_working_tree_review(location.clone(), directory.clone(), staged, cx)
+                panel.set_working_tree_review(location.clone(), directory.clone(), staged, cx);
+                let target = source.clone();
+                let attach: crate::diff_view::AttachHandler =
+                    std::rc::Rc::new(move |text: String, _window: &mut Window, cx: &mut App| {
+                        if let Some(source) = target.upgrade() {
+                            attach_to_composer(&source, &text, cx);
+                        }
+                    });
+                panel.set_review_source(source.clone(), attach, cx);
             },
             window,
             cx,
         );
+    }
+
+    /// Ctrl+Alt+G: the Review pane for the active conversation. From a
+    /// review column it closes back to its conversation.
+    pub(super) fn open_review_pane(
+        &mut self,
+        _: &OpenReviewPane,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(slot) = self.slots.get(self.active).filter(|slot| !slot.closing) else {
+            return;
+        };
+        let panel = slot.panel.clone();
+        if panel.read(cx).is_change_review() {
+            self.close_change_review(
+                &CloseChangeReview {
+                    panel: panel.entity_id(),
+                },
+                window,
+                cx,
+            );
+            return;
+        }
+        if panel.read(cx).git_changes_context().is_none() {
+            return;
+        }
+        self.open_working_tree_changes(
+            &OpenWorkingTreeChanges {
+                source: panel.entity_id(),
+                staged: false,
+            },
+            window,
+            cx,
+        );
+    }
+
+    pub(super) fn toggle_review_maximize(
+        &mut self,
+        request: &ToggleReviewMaximize,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(index) = self
+            .slots
+            .iter()
+            .position(|slot| !slot.closing && slot.panel.entity_id() == request.panel)
+        else {
+            return;
+        };
+        self.toggle_slot_maximize(index, cx);
+    }
+
+    /// Ctrl+Shift+Enter: maximize or restore the active Review pane.
+    pub(super) fn toggle_review_maximize_active(
+        &mut self,
+        _: &ToggleReviewMaximizeActive,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let index = self.active;
+        if self
+            .slots
+            .get(index)
+            .is_some_and(|slot| !slot.closing && slot.panel.read(cx).is_change_review())
+        {
+            self.toggle_slot_maximize(index, cx);
+        } else {
+            cx.propagate();
+        }
+    }
+
+    /// Active panel and its width fraction, for Review pane tests.
+    #[cfg(test)]
+    pub(crate) fn test_active_slot(&self) -> (Entity<Panel>, f32) {
+        let slot = &self.slots[self.active];
+        (slot.panel.clone(), slot.width_fraction)
+    }
+
+    fn toggle_slot_maximize(&mut self, index: usize, cx: &mut Context<Self>) {
+        let slot = &mut self.slots[index];
+        let (width, restore) = toggle_maximize(slot.width_fraction, slot.restore_fraction);
+        slot.width_fraction = width;
+        slot.animated_width.set(width, Instant::now());
+        slot.restore_fraction = restore;
+        self.set_active(index, cx);
+        self.retarget_camera();
+        cx.notify();
     }
 
     /// Show a review beside its source conversation, reusing that

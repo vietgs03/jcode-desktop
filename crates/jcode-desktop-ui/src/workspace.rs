@@ -197,6 +197,7 @@ actions!(
         OpenFolder,
         ToggleOverview,
         ToggleSwarmView,
+        ToggleReviewMaximizeActive,
         ToggleHints,
         ToggleShowcase,
         ToggleSidebar,
@@ -8831,6 +8832,9 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::open_change_review))
             .on_action(cx.listener(Self::close_change_review))
             .on_action(cx.listener(Self::open_working_tree_changes))
+            .on_action(cx.listener(Self::open_review_pane))
+            .on_action(cx.listener(Self::toggle_review_maximize))
+            .on_action(cx.listener(Self::toggle_review_maximize_active))
             .on_action(cx.listener(Self::new_panel))
             .on_action(cx.listener(Self::new_panel_in_pinned_directory))
             .on_action(cx.listener(Self::fork_panel))

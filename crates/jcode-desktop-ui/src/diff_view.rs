@@ -212,7 +212,13 @@ pub(crate) struct DiffView {
     label: Option<SharedString>,
     copied: Option<String>,
     counts: (usize, usize),
+    /// Hide the view toolbar; a containing review provides it.
+    bare: bool,
+    /// "Attach to chat" on file headers, given the fenced diff.
+    attach: Option<AttachHandler>,
 }
+
+pub(crate) type AttachHandler = std::rc::Rc<dyn Fn(String, &mut Window, &mut App)>;
 
 impl DiffView {
     pub(crate) fn new(preview: DiffPreview, cx: &mut Context<Self>) -> Self {
@@ -243,6 +249,27 @@ impl DiffView {
             label: None,
             copied: None,
             counts,
+            bare: false,
+            attach: None,
+        }
+    }
+
+    pub(crate) fn set_bare(&mut self, bare: bool) {
+        self.bare = bare;
+    }
+
+    pub(crate) fn set_attach(&mut self, attach: Option<AttachHandler>) {
+        self.attach = attach;
+    }
+
+    pub(crate) fn split(&self) -> bool {
+        self.split
+    }
+
+    pub(crate) fn set_split(&mut self, split: bool, cx: &mut Context<Self>) {
+        if self.split != split {
+            let key = String::new();
+            self.activate(if split { Control::Split } else { Control::Unified }, key, cx);
         }
     }
 
@@ -571,7 +598,28 @@ impl DiffView {
                                 false,
                                 Control::CopyPath(index),
                                 cx,
-                            )),
+                            ))
+                            .when_some(self.attach.clone(), |el, attach| {
+                                let text = format!("```diff\n{}```\n", file.plain_text());
+                                let id = format!("diff-attach-{index}");
+                                let selector = id.clone();
+                                el.child(
+                                    div()
+                                        .id(SharedString::from(id))
+                                        .debug_selector(move || selector.clone())
+                                        .px_2()
+                                        .py_1()
+                                        .rounded_sm()
+                                        .cursor_pointer()
+                                        .text_color(theme.ACCENT)
+                                        .hover(|el| el.bg(theme.HEADER_BG))
+                                        .child("Attach to chat")
+                                        .on_click(move |_, window, cx| {
+                                            cx.stop_propagation();
+                                            attach(text.clone(), window, cx);
+                                        }),
+                                )
+                            }),
                     ),
             );
         if state.collapsed {
@@ -819,8 +867,9 @@ impl Render for DiffView {
             .gap_2()
             .text_size(px(11.))
             .text_color(Theme::global().TEXT)
-            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-            .child(
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation());
+        if !self.bare {
+            view = view.child(
                 div()
                     .flex()
                     .flex_row()
@@ -877,6 +926,7 @@ impl Render for DiffView {
                         cx,
                     )),
             );
+        }
         let start = self.file_page * PAGE_FILES;
         let end = (start + PAGE_FILES).min(self.files.len());
         if self.files.len() > PAGE_FILES {

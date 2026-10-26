@@ -86,6 +86,8 @@ mod cache_miss;
 mod composer;
 #[path = "panel_changes.rs"]
 mod changes;
+#[path = "review_pane.rs"]
+mod review_pane;
 #[path = "panel_diff.rs"]
 mod diff_review;
 #[path = "panel_effort.rs"]
@@ -1814,7 +1816,7 @@ impl Panel {
                         // `/changes` opens the live Changes review when Desktop can
                         // reach the checkout. Otherwise the command explains why.
                         if images.is_empty()
-                            && let Some(staged) = changes::changes_command(&content)
+                            && let Some(staged) = review_pane::review_command(&content)
                             && let Some(panel) = weak.upgrade()
                             && panel.read(app).git_changes_context().is_some()
                         {
@@ -3759,7 +3761,16 @@ impl Panel {
             }
             Item::Stopped(notice) => self.render_stop_notice(index, notice, window, cx),
             Item::CacheMiss(notice) => self.render_cache_miss_notice(index, notice, window, cx),
-            Item::ResponseStats(stats) => stats.render(index).into_any_element(),
+            Item::ResponseStats(stats) => match self.turn_review_button(index, cx) {
+                Some(button) => div()
+                    .flex()
+                    .flex_col()
+                    .items_start()
+                    .child(stats.render(index))
+                    .child(button)
+                    .into_any_element(),
+                None => stats.render(index).into_any_element(),
+            },
             Item::User(text) if jcode_sdk::todo::is_auto_poke_message(text) => {
                 self.render_auto_poke_notice(index, text, window, cx)
             }
