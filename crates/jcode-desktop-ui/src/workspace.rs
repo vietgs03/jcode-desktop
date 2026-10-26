@@ -882,6 +882,8 @@ pub struct Workspace {
     folder_picker_dir: Option<PathBuf>,
     folder_picker_error: Option<String>,
     folder_search: Option<Entity<PromptInput>>,
+    /// The window's target machine: indicator menu and WSL folder browsing.
+    machine: machine::State,
     rename_editor: Option<rename::Editor>,
     focus_restore: FocusSnapshot,
     performance: Option<PerformanceProfile>,
@@ -1188,6 +1190,7 @@ impl Workspace {
             folder_picker_dir: None,
             folder_picker_error: None,
             folder_search: None,
+            machine: Default::default(),
             rename_editor: None,
             focus_restore: FocusSnapshot::Workspace,
             performance: performance_enabled.then(PerformanceProfile::default),
@@ -1578,6 +1581,7 @@ impl Workspace {
             folder_picker_dir: None,
             folder_picker_error: None,
             folder_search: None,
+            machine: Default::default(),
             rename_editor: None,
             focus_restore: FocusSnapshot::Workspace,
             performance: None,
@@ -1752,7 +1756,12 @@ impl Workspace {
                 if let Some(host) = remote_host {
                     let host = remotes::new_session_host(&host).to_owned();
                     panel_state.session_id = pending::next_remote_draft_id(&host);
-                    self.create_remote_draft_session(host, panel_state.session_id.clone(), cx);
+                    self.create_remote_draft_session(
+                        host,
+                        panel_state.session_id.clone(),
+                        panel_state.working_dir.clone(),
+                        cx,
+                    );
                 } else if !panel_state
                     .session_id
                     .starts_with("startup://draft/remote/")
@@ -3851,6 +3860,10 @@ impl Workspace {
         );
         self.folder_picker_error = None;
         self.folder_search = Some(self.create_folder_search(cx));
+        self.machine.menu_open = false;
+        if !self.begin_machine_folder_picker(cx) {
+            self.end_machine_folder_picker();
+        }
         cx.defer_in(window, |this, window, cx| {
             if let Some(search) = &this.folder_search {
                 let focus_handle = search.read(cx).focus_handle.clone();
@@ -3863,6 +3876,9 @@ impl Workspace {
     fn open_searched_folder(&mut self, query: &str, cx: &mut Context<Self>) {
         if self.folder_picker_sets_default {
             self.set_searched_default_directory(query, cx);
+            return;
+        }
+        if self.machine_open_searched(query, cx) {
             return;
         }
         let Some(base) = self.folder_picker_dir.as_deref() else {
@@ -3933,6 +3949,7 @@ impl Workspace {
     }
 
     fn close_folder_picker(&mut self, cx: &mut Context<Self>) {
+        self.end_machine_folder_picker();
         self.remove_default_directory_panel(cx);
         self.folder_picker_sets_default = false;
         self.folder_picker_dir = None;
@@ -3945,6 +3962,10 @@ impl Workspace {
     /// Open a session without attributing the choice to the keyboard. Pointer
     /// paths call this directly, so clicking never earns keyboard credit.
     fn open_new_session(&mut self, cx: &mut Context<Self>) {
+        // Same machine and repo as the active panel, else the machine default.
+        if self.open_session_like_active(cx) {
+            return;
+        }
         self.open_default_draft(self.default_working_dir(), cx);
     }
 
@@ -6903,6 +6924,7 @@ impl Workspace {
                         |el| el.child(self.render_sidebar_scrollbar(cx)),
                     ),
             )
+            .child(self.render_remote_indicator(cx))
             .child(self.render_sidebar_account(cx))
             .into_any_element()
     }
@@ -8404,7 +8426,8 @@ impl Workspace {
                                         }),
                                     )
                                     .child("▣  computer"),
-                            ),
+                            )
+                            .children(self.render_picker_wsl_chip(cx)),
                     )
                     .when_some(self.folder_search.clone(), |el, search| {
                         el.child(
@@ -8914,7 +8937,12 @@ impl Render for Workspace {
             })
             .when(
                 self.folder_picker_dir.is_some() && !self.folder_picker_sets_default,
-                |root| root.child(self.render_folder_picker(cx)),
+                |root| {
+                    root.child(
+                        self.render_wsl_folder_picker(cx)
+                            .unwrap_or_else(|| self.render_folder_picker(cx)),
+                    )
+                },
             )
             .when(self.rename_editor.is_some(), |root| {
                 root.child(self.render_rename_editor(cx))
@@ -15686,6 +15714,11 @@ mod startup_tests;
 
 #[path = "workspace_pending.rs"]
 mod pending;
+#[path = "workspace_machine.rs"]
+mod machine;
+#[cfg(test)]
+#[path = "workspace_machine_tests.rs"]
+mod machine_tests;
 #[cfg(test)]
 #[path = "workspace_pending_tests.rs"]
 mod pending_tests;
