@@ -29,7 +29,8 @@ pub struct SessionMeta {
     pub saved: bool,
     pub save_label: Option<String>,
     pub parent_id: Option<String>,
-    /// Stored messages by role (tool results are stored as user messages).
+    /// User messages that start with text: prompts, not tool results (which
+    /// are stored as user messages too and usually outnumber prompts 20:1).
     pub user_messages: usize,
     pub assistant_messages: usize,
     /// The first prompt a person typed, without injected system reminders.
@@ -105,30 +106,39 @@ fn read_local(id: &str) -> Result<SessionMeta, String> {
     let mut tail = vec![0; WINDOW];
     file.read_exact(&mut tail).map_err(|e| e.to_string())?;
     file.seek(SeekFrom::Start(0)).map_err(|e| e.to_string())?;
+    let (user, assistant) = count_stream(&mut file, 4 << 20).map_err(|e| e.to_string())?;
+    Ok(parse(&head, &tail, bytes, user, assistant))
+}
+
+/// Role counts over a reader in fixed chunks. One carry per needle, each kept
+/// one byte shorter than its needle, so a match split across reads counts
+/// once and none counts twice.
+fn count_stream(reader: &mut impl std::io::Read, chunk_size: usize) -> std::io::Result<(usize, usize)> {
     let (mut user, mut assistant) = (0, 0);
-    let mut chunk = vec![0; 4 << 20];
-    let mut carry = Vec::new();
+    let mut chunk = vec![0; chunk_size];
+    let mut carries = [Vec::new(), Vec::new()];
     loop {
-        let read = file.read(&mut chunk).map_err(|e| e.to_string())?;
+        let read = reader.read(&mut chunk)?;
         if read == 0 {
             break;
         }
-        carry.extend_from_slice(&chunk[..read]);
-        let (u, a) = count_roles(&carry);
-        user += u;
-        assistant += a;
-        // Keep a short overlap so a needle split across reads still counts
-        // once: the overlap is shorter than either needle.
-        let keep = carry.len().min(USER_NEEDLE.len() - 1);
-        carry.drain(..carry.len() - keep);
+        for (carry, (needle, total)) in carries
+            .iter_mut()
+            .zip([(USER_NEEDLE, &mut user), (ASSISTANT_NEEDLE, &mut assistant)])
+        {
+            carry.extend_from_slice(&chunk[..read]);
+            *total += count_needle(carry, needle);
+            let keep = carry.len().min(needle.len() - 1);
+            carry.drain(..carry.len() - keep);
+        }
     }
-    Ok(parse(&head, &tail, bytes, user, assistant))
+    Ok((user, assistant))
 }
 
 /// Prints `size RS head RS tail RS role-initial counts` for `$HOME/.jcode/sessions/$1.json`.
 const WSL_SCRIPT: &str = "f=\"$HOME/.jcode/sessions/$1.json\"; [ -f \"$f\" ] || exit 3; \
     wc -c < \"$f\"; printf '\\036'; head -c 65536 \"$f\"; printf '\\036'; tail -c 65536 \"$f\"; printf '\\036'; \
-    grep -oE '\"role\":\"(user|assistant)\"' \"$f\" | cut -c9 | sort | uniq -c";
+    grep -oE '\"role\":\"(user\",\"content\":\\[\\{\"type\":\"text|assistant)\"' \"$f\" | cut -c9 | sort | uniq -c";
 
 fn read_wsl(location: &Location, id: &str) -> Result<SessionMeta, String> {
     let mut command = location.command("/", "sh");
@@ -165,12 +175,15 @@ fn parse_wsl_output(stdout: &[u8]) -> Option<SessionMeta> {
     Some(parse(head, tail, bytes, user, assistant))
 }
 
-const USER_NEEDLE: &[u8] = b"\"role\":\"user\"";
+const USER_NEEDLE: &[u8] = b"\"role\":\"user\",\"content\":[{\"type\":\"text\"";
 const ASSISTANT_NEEDLE: &[u8] = b"\"role\":\"assistant\"";
 
+fn count_needle(bytes: &[u8], needle: &[u8]) -> usize {
+    bytes.windows(needle.len()).filter(|w| *w == needle).count()
+}
+
 fn count_roles(bytes: &[u8]) -> (usize, usize) {
-    let count = |needle: &[u8]| bytes.windows(needle.len()).filter(|w| *w == needle).count();
-    (count(USER_NEEDLE), count(ASSISTANT_NEEDLE))
+    (count_needle(bytes, USER_NEEDLE), count_needle(bytes, ASSISTANT_NEEDLE))
 }
 
 fn parse(head: &[u8], tail: &[u8], bytes: u64, user: usize, assistant: usize) -> SessionMeta {
@@ -323,6 +336,26 @@ mod tests {
         assert_eq!((meta.user_messages, meta.assistant_messages), (42, 40));
         assert_eq!(meta.first_prompt.as_deref(), Some("Fix the ladder please"));
         assert_eq!(meta.estimated_tokens(), record.len() as u64 / 4);
+    }
+
+    #[test]
+    fn tool_results_are_not_counted_as_prompts() {
+        let record = RECORD.replace(
+            r#"{"id":"m2","#,
+            r#"{"id":"t1","role":"user","content":[{"type":"tool_result","tool_use_id":"x","content":"ok"}]},{"id":"m2","#,
+        );
+        assert_eq!(count_roles(record.as_bytes()), (1, 1));
+    }
+
+    #[test]
+    fn streamed_counts_match_whole_counts_at_every_chunk_size() {
+        let record = RECORD.repeat(7);
+        let whole = count_roles(record.as_bytes());
+        assert_eq!(whole, (7, 7));
+        for chunk in 1..64 {
+            let mut reader = std::io::Cursor::new(record.as_bytes());
+            assert_eq!(count_stream(&mut reader, chunk).unwrap(), whole, "chunk {chunk}");
+        }
     }
 
     #[test]

@@ -877,8 +877,9 @@ impl Workspace {
             let counts = match meta {
                 Some(meta) => [
                     Some(format!(
-                        "{} msg",
-                        meta.user_messages + meta.assistant_messages
+                        "{} prompt{}",
+                        meta.user_messages,
+                        if meta.user_messages == 1 { "" } else { "s" }
                     )),
                     meta.model.clone(),
                     Some(format_estimated_tokens(meta.estimated_tokens())),
@@ -1583,10 +1584,8 @@ impl Workspace {
             };
             lines.push(join(vec![
                 Some(format!(
-                    "{} messages ({} user, {} assistant)",
-                    meta.user_messages + meta.assistant_messages,
-                    meta.user_messages,
-                    meta.assistant_messages
+                    "{} prompts · {} replies",
+                    meta.user_messages, meta.assistant_messages
                 )),
                 model,
                 Some(format!("~{}", format_estimated_tokens(meta.estimated_tokens()))),
@@ -2642,7 +2641,7 @@ mod tests {
             w.resume_info_lines(&session, 0)
         });
         let text = lines.join("\n");
-        assert!(text.contains("142 messages (38 user, 104 assistant)"), "{text}");
+        assert!(text.contains("38 prompts · 104 replies"), "{text}");
         assert!(text.contains("claude-opus (claude)"), "{text}");
         assert!(text.contains("created 2026-10-23 14:02 UTC"), "{text}");
         assert!(text.contains("saved as ladder"), "{text}");

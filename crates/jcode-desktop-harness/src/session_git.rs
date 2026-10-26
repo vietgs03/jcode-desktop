@@ -11,15 +11,15 @@ use std::process::Command;
 const WSL_CONCURRENCY: usize = 3;
 const WSL_RETRIES: usize = 2;
 
-mod wsl_gate {
+pub(crate) mod wsl_gate {
     use std::sync::{Condvar, Mutex};
 
     static ACTIVE: Mutex<usize> = Mutex::new(0);
     static FREED: Condvar = Condvar::new();
 
-    pub(super) struct Permit;
+    pub(crate) struct Permit;
 
-    pub(super) fn acquire() -> Permit {
+    pub(crate) fn acquire() -> Permit {
         let mut active = ACTIVE.lock().unwrap_or_else(|e| e.into_inner());
         while *active >= super::WSL_CONCURRENCY {
             active = FREED.wait(active).unwrap_or_else(|e| e.into_inner());

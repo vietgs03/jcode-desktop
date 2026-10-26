@@ -216,6 +216,9 @@ fn read_wsl(host: &str, roster: &mut Roster) -> bool {
     let Some(distro) = jcode_sdk::wsl_distro(host) else {
         return false;
     };
+    // Share the wsl.exe cap with git probes so a startup burst cannot starve
+    // WSL's vsock accept queue, and time the read from when it may run.
+    let _permit = crate::session_git::wsl_gate::acquire();
     let started = Instant::now();
     let mut command = std::process::Command::new("wsl.exe");
     if let Some(distro) = distro {
