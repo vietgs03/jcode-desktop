@@ -356,6 +356,8 @@ impl Workspace {
     }
 
     pub(super) fn open_swarm_view(&mut self, cx: &mut Context<Self>) {
+        // One content-area view at a time.
+        self.resume = None;
         if self.swarm_view.is_none() {
             self.swarm_view = Some(SwarmViewState::default());
             // One on-demand refresh; liveness then follows normal roster updates.

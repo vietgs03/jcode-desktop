@@ -485,6 +485,8 @@ impl Workspace {
             window.focus(&state.search.focus_handle(cx), cx);
             return;
         }
+        // One content-area view at a time.
+        self.swarm_view = None;
         let submit = cx.weak_entity();
         let change = submit.clone();
         let search = cx.new(|cx| {
@@ -1114,17 +1116,65 @@ impl Workspace {
         } else {
             preview = preview.child("Select a session to see its details.");
         }
-        div()
-            .debug_selector(|| "resume-panel".into())
-            .size_full()
+        let session_count = matches.len();
+        let header = div()
+            .flex()
+            .flex_none()
+            .items_center()
+            .gap_3()
+            .px_4()
+            .h(px(44.0))
+            .border_b_1()
+            .border_color(theme.PANEL_BORDER)
+            .bg(theme.HEADER_BG)
+            .child(
+                div()
+                    .flex_none()
+                    .text_size(px(14.0))
+                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                    .text_color(theme.TEXT)
+                    .child("Sessions"),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .truncate()
+                    .text_size(px(11.0))
+                    .text_color(theme.TEXT_FAINT)
+                    .child(format!("{session_count} shown")),
+            )
+            .child(
+                div()
+                    .id("resume-close")
+                    .debug_selector(|| "resume-close".into())
+                    .flex_none()
+                    .px_2()
+                    .py(px(3.0))
+                    .rounded_md()
+                    .text_size(px(11.0))
+                    .text_color(theme.TEXT_DIM)
+                    .cursor_pointer()
+                    .hover(|el| el.bg(theme.TOOL_BG).text_color(theme.TEXT))
+                    .on_click(cx.listener(|this, _, window, cx| this.close_resume(window, cx)))
+                    .child("Close (Esc)"),
+            );
+        let body = div()
+            .flex_1()
+            .min_h_0()
             .p_4()
             .flex()
             .flex_col()
-            .gap_3()
+            .gap_3();
+        div()
+            .debug_selector(|| "resume-panel".into())
+            .size_full()
+            .flex()
+            .flex_col()
             .bg(theme.PANEL_BG)
             .text_color(theme.TEXT)
             .font_family(theme.FONT_UI)
-            .text_size(px(14.0))
+            .text_size(px(13.0))
             .track_focus(&self.focus_handle)
             .capture_key_down(cx.listener(Self::resume_key_down))
             .capture_action(cx.listener(|this, _: &crate::input::Clear, window, cx| {
@@ -1143,27 +1193,9 @@ impl Workspace {
                 this.move_resume_selection("down", cx);
                 cx.stop_propagation();
             }))
+            .child(header)
             .child(
-                div()
-                    .flex()
-                    .justify_between()
-                    .items_center()
-                    .child(div().text_size(px(22.0)).child("Resume session"))
-                    .child(
-                        div()
-                            .id("resume-close")
-                            .debug_selector(|| "resume-close".into())
-                            .cursor_pointer()
-                            .px_3()
-                            .py_2()
-                            .rounded_md()
-                            .hover(|el| el.bg(theme.TOOL_BG))
-                            .on_click(
-                                cx.listener(|this, _, window, cx| this.close_resume(window, cx)),
-                            )
-                            .child("Back · Esc"),
-                    ),
-            )
+                body
             .child(
                 div()
                     .debug_selector(|| "resume-search".into())
@@ -1330,7 +1362,8 @@ impl Workspace {
                     .child(
                         div()
                             .w(relative(0.4))
-                            .min_w_0()
+                            .min_w(px(320.0))
+                            .flex_none()
                             .flex()
                             .flex_col()
                             .child(rows),
@@ -1339,7 +1372,8 @@ impl Workspace {
             )
             .child(div().text_size(px(11.0)).text_color(theme.TEXT_DIM).child(
                 "↑ ↓ Select   Page Up / Down   Enter / double-click Resume   Ctrl+Enter New panel   Esc Back   Ctrl+1/2/3/4 Filters",
-            ))
+            )),
+            )
     }
 
     fn load_resume_preview(&mut self, selected: Option<&str>, cx: &mut Context<Self>) {
@@ -2511,6 +2545,50 @@ mod tests {
             modifiers: Default::default(),
         });
         vcx.run_until_parked();
+    }
+
+    #[gpui::test]
+    fn browser_stays_inside_the_desktop_beside_the_sidebar(cx: &mut gpui::TestAppContext) {
+        let (workspace, vcx, _commands) = browser_with(
+            cx,
+            vec![session_info("first", Some("First")), session_info("second", Some("Second"))],
+        );
+        workspace.update(vcx, |w, cx| {
+            w.show_sidebar = true;
+            cx.notify();
+        });
+        vcx.run_until_parked();
+        let sidebar = vcx.debug_bounds("sidebar").expect("sidebar stays painted");
+        let browser = vcx.debug_bounds("resume-panel").expect("browser paints");
+        assert!(
+            browser.left() >= sidebar.right() - px(1.0),
+            "browser {browser:?} sits right of the sidebar {sidebar:?}"
+        );
+        // Opening a session from anywhere (sidebar, agents board) leaves the browser.
+        let second = workspace.read_with(vcx, |w, _| w.sessions[1].clone());
+        workspace.update_in(vcx, |w, window, cx| w.activate_session(second, window, cx));
+        vcx.run_until_parked();
+        workspace.read_with(vcx, |w, cx| {
+            assert!(w.resume.is_none());
+            assert_eq!(w.slots[w.active].panel.read(cx).session_id, "second");
+        });
+        assert!(vcx.debug_bounds("resume-panel").is_none());
+    }
+
+    #[gpui::test]
+    fn browser_and_swarm_view_replace_each_other(cx: &mut gpui::TestAppContext) {
+        let (workspace, vcx, _commands) =
+            browser_with(cx, vec![session_info("first", Some("First"))]);
+        workspace.update(vcx, |w, cx| w.open_swarm_view(cx));
+        vcx.run_until_parked();
+        workspace.read_with(vcx, |w, _| {
+            assert!(w.resume.is_none() && w.swarm_view.is_some());
+        });
+        workspace.update_in(vcx, |w, window, cx| w.open_resume(&OpenResume, window, cx));
+        vcx.run_until_parked();
+        workspace.read_with(vcx, |w, _| {
+            assert!(w.resume.is_some() && w.swarm_view.is_none());
+        });
     }
 
     #[gpui::test]

@@ -2681,6 +2681,10 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // Opening any session from the sidebar, Swarm view or Agents board
+        // leaves the content-area views for that session.
+        self.resume = None;
+        self.swarm_view = None;
         let index = self
             .slots
             .iter()
@@ -8523,7 +8527,9 @@ impl Render for Workspace {
             let root = self.voice_modal_root(content, cx);
             return crate::window_caption::wrap(root, window, true);
         }
-        if self.resume.is_some() {
+        if self.resume.is_some() && self.single_panel {
+            // A standalone chat window has no sidebar to keep, so the
+            // browser keeps the whole window there.
             self.dump_state(window, cx);
             let root = self.render_resume(cx);
             return crate::window_caption::wrap(root, window, true);
@@ -8666,7 +8672,11 @@ impl Render for Workspace {
         }
 
         self.advance_hidden_strip_animations(now, overview_progress > 0.0);
-        let content = if self.swarm_view.is_some() {
+        let content = if self.resume.is_some() {
+            // The session browser lives in the content area, beside the
+            // sidebar, like the Swarm view: never a separate screen.
+            self.render_resume(cx).into_any_element()
+        } else if self.swarm_view.is_some() {
             self.render_swarm_view(cx)
         } else if overview_progress > 0.0 {
             div()
