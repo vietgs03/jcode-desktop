@@ -76,6 +76,8 @@ pub(super) use jcode_desktop_harness::session_meta::SessionMeta;
 const PEEK_PREVIEW: u32 = 60;
 const PEEK_FULL: u32 = 5_000;
 const PEEK_TIMEOUT: Duration = Duration::from_secs(25);
+/// Remote previews start once the selection has rested this long.
+const REMOTE_PREVIEW_SETTLE: Duration = Duration::from_millis(150);
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(super) enum Machine {
@@ -1387,11 +1389,27 @@ impl Workspace {
         state.preview_full = false;
         state.peek_pending = None;
         state.preview_task = None;
-        self.load_resume_meta(id, cx);
         if harness::remote_host(id).is_some() && !harness::screenshot_mode() {
-            self.peek_resume_preview(id.to_owned(), PEEK_PREVIEW, cx);
+            // Each remote preview costs a wsl.exe launch (meta) and a bridge
+            // peek. Wait until the selection settles so holding an arrow key
+            // through 30 rows launches 2 processes, not 60.
+            let requested = id.to_owned();
+            state.preview_task = Some(cx.spawn(async move |this, cx| {
+                cx.background_executor().timer(REMOTE_PREVIEW_SETTLE).await;
+                let _ = this.update(cx, |this, cx| {
+                    let current = this
+                        .resume
+                        .as_ref()
+                        .is_some_and(|state| state.preview_id.as_ref() == Some(&requested));
+                    if current {
+                        this.load_resume_meta(&requested, cx);
+                        this.peek_resume_preview(requested, PEEK_PREVIEW, cx);
+                    }
+                });
+            }));
             return;
         }
+        self.load_resume_meta(id, cx);
         let state = self.resume.as_mut().expect("resume picker is open");
         let id = id.to_owned();
         let requested_id = id.clone();
@@ -2643,11 +2661,39 @@ mod tests {
     }
 
     #[gpui::test]
+    fn browser_arrowing_through_wsl_rows_peeks_only_where_it_stops(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let rows: Vec<_> = (0..6)
+            .map(|i| session_info(&format!("ssh://wsl/session_fox_{i}"), Some("Fox")))
+            .collect();
+        let (workspace, vcx, commands) = browser_with(cx, rows);
+        for _ in 0..5 {
+            vcx.simulate_keystrokes("down");
+            vcx.executor().advance_clock(REMOTE_PREVIEW_SETTLE / 3);
+            vcx.run_until_parked();
+        }
+        vcx.executor().advance_clock(REMOTE_PREVIEW_SETTLE * 2);
+        vcx.run_until_parked();
+        let last = workspace.read_with(vcx, |w, _| w.resume.as_ref().unwrap().selected.clone());
+        let peeks: Vec<String> = std::iter::from_fn(|| commands.try_recv().ok())
+            .filter_map(|command| match command {
+                harness::Command::PeekRemote { session_id, .. } => Some(session_id),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(peeks.len(), 1, "{peeks:?}");
+        assert_eq!(Some(&peeks[0]), last.as_ref());
+    }
+
+    #[gpui::test]
     fn browser_wsl_preview_uses_peek_remote(cx: &mut gpui::TestAppContext) {
         let id = "ssh://wsl/session_fox_1";
         let mut wsl = session_info(id, Some("Fox"));
         wsl.working_dir = Some("/home/v/go-chathub".into());
         let (workspace, vcx, commands) = browser_with(cx, vec![wsl]);
+        vcx.executor().advance_clock(REMOTE_PREVIEW_SETTLE * 2);
+        vcx.run_until_parked();
         let mut peeked = None;
         while let Ok(command) = commands.try_recv() {
             if let harness::Command::PeekRemote { session_id, limit } = command {

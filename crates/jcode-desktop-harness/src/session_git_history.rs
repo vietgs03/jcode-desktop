@@ -470,4 +470,47 @@ mod tests {
         assert!(show_commit(&Location::Local, ".", "--output=x").is_err());
         assert!(diff_range(&Location::Local, ".", "-x", None).is_err());
     }
+
+    /// The whole Review History path against a real checkout: graph page,
+    /// commit detail, base branch and a range diff. Uses this repository
+    /// locally, and also the WSL repo when `JCODE_WSL_TEST_REPO` is set.
+    #[test]
+    fn history_round_trip_on_real_repositories() {
+        let local = env!("CARGO_MANIFEST_DIR").to_owned();
+        let mut targets = vec![(Location::Local, local)];
+        if let Ok(repo) = std::env::var("JCODE_WSL_TEST_REPO") {
+            targets.push((Location::Wsl(None), repo));
+        }
+        for (location, directory) in targets {
+            let started = std::time::Instant::now();
+            let page = match log_graph(&location, &directory, 0, 50) {
+                Ok(page) => page,
+                // Not a git checkout (packaged source); nothing to check.
+                Err(_) if matches!(location, Location::Local) => continue,
+                Err(error) => panic!("{location:?} {directory}: log_graph failed: {error}"),
+            };
+            assert!(!page.is_empty(), "{directory}: empty log");
+            let rows = layout_graph(&page);
+            assert_eq!(rows.len(), page.len());
+            let next = log_graph(&location, &directory, 1, 1).unwrap();
+            if page.len() > 1 {
+                assert_eq!(next[0].hash, page[1].hash, "skip pages by date order");
+            }
+            let head = &page[0];
+            let detail = show_commit(&location, &directory, &head.hash).unwrap();
+            assert_eq!(detail.commit.hash, head.hash);
+            let all = branches(&location, &directory).unwrap();
+            assert!(!all.is_empty());
+            if let Some(oldest) = page.last().filter(|c| c.hash != head.hash) {
+                let (patch, _) = diff_range(&location, &directory, &oldest.hash, None).unwrap();
+                assert!(patch.contains("diff --git") || patch.is_empty());
+            }
+            eprintln!(
+                "{location:?} {directory}: {} commits, {} branches, {:?}",
+                page.len(),
+                all.len(),
+                started.elapsed()
+            );
+        }
+    }
 }
