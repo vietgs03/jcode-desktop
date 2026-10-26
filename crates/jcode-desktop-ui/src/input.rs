@@ -151,6 +151,9 @@ pub fn bind_keys(cx: &mut App) {
     // Registered after the composer keys so the effort chords outrank word
     // motion in a chat composer. See `effort::bind_keys` for the fallthrough.
     crate::effort::bind_keys(cx);
+    // Last, so find's Enter/Escape/Ctrl+F outrank the composer's at equal
+    // depth (Ctrl+F falls through to word motion while a draft is edited).
+    cx.bind_keys(crate::panel::find::bindings());
 }
 
 pub struct PromptInput {
@@ -1010,6 +1013,10 @@ impl PromptInput {
     }
 
     fn select_all(&mut self, _: &SelectAll, _: &mut Window, cx: &mut Context<Self>) {
+        self.select_all_text(cx);
+    }
+
+    pub(crate) fn select_all_text(&mut self, cx: &mut Context<Self>) {
         self.move_to(0, cx);
         self.select_to(self.content.len(), cx)
     }

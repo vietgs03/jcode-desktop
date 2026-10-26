@@ -90,6 +90,8 @@ mod changes;
 mod diff_review;
 #[path = "panel_effort.rs"]
 mod effort_switch;
+#[path = "panel_find.rs"]
+pub(crate) mod find;
 #[path = "panel_flicker.rs"]
 mod flicker;
 #[path = "panel_image_pane.rs"]
@@ -528,6 +530,8 @@ pub struct Panel {
     publish_armed_at: Option<Instant>,
     transcript_selection: Entity<TextSelection>,
     transcript_text_document: text_document::TranscriptTextDocument,
+    /// Ctrl+F find bar state while it is open.
+    find: Option<find::FindState>,
     transcript_dragging: bool,
     changelog_view: crate::update_notes::View,
     /// Remaining wheel travel. Precise touchpad input stays directly mapped
@@ -1008,6 +1012,7 @@ impl Panel {
             publish_armed_at: None,
             transcript_selection,
             transcript_text_document: Default::default(),
+            find: None,
             transcript_dragging: false,
             changelog_view: crate::update_notes::View::Latest,
             transcript_wheel_glide: WheelGlide::default(),
@@ -4786,6 +4791,7 @@ impl Render for Panel {
         let rows = derived.rows.clone();
         let prompt_rows = derived.prompt_rows.clone();
         let latest_todo = derived.latest_todo.clone();
+        self.sync_find(window, cx);
         // The publish tracker replaces the collapsible todo summary with
         // fixed, always-visible pipeline stages fed by the same snapshot.
         let publish_tracker = self.render_publish_tracker(latest_todo.as_ref());
@@ -5201,6 +5207,7 @@ impl Render for Panel {
             .on_action(cx.listener(|panel, _: &shortcuts::JumpToLatest, _, cx| {
                 panel.jump_to_latest(cx);
             }))
+            .map(|el| find::actions(el, cx))
             .on_action(
                 cx.listener(|panel, _: &shortcuts::BackgroundRunningTool, _, cx| {
                     panel.background_running_tool_if_any(cx);
@@ -5494,6 +5501,7 @@ impl Render for Panel {
             .child(self.input.read(cx).paste_preview_panel_marker())
             .children(self.render_image_preview(window, cx))
             .children(self.render_diff_review(cx))
+            .children(self.render_find_bar(cx))
             .children(self.render_login_picker(window, cx))
             .into_any_element();
 

@@ -14,6 +14,8 @@ pub(super) struct TranscriptTextDocument {
     /// changes only those, many times a second.
     settled_revision: Option<u64>,
     display: Option<crate::config::DisplayConfig>,
+    /// The virtual-list row position of each leaf key in the last document.
+    key_rows: HashMap<SharedString, usize>,
 }
 
 impl TranscriptTextDocument {
@@ -83,12 +85,23 @@ impl TranscriptTextDocument {
         let retained: HashSet<_> = order.iter().copied().collect();
         self.rows.retain(|index, _| retained.contains(index));
         self.order = order;
+        self.key_rows.clear();
+        for (position, index) in self.order.iter().enumerate() {
+            for (key, _) in &self.rows[index].1 {
+                self.key_rows.insert(key.clone(), position);
+            }
+        }
         Some(
             self.order
                 .iter()
                 .flat_map(|index| self.rows[index].1.iter().cloned())
                 .collect(),
         )
+    }
+
+    /// The virtual-list row that paints the leaf with this key.
+    pub(super) fn row_of(&self, key: &str) -> Option<usize> {
+        self.key_rows.get(key).copied()
     }
 }
 

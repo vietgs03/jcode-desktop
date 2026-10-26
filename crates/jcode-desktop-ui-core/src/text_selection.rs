@@ -73,6 +73,8 @@ struct PaintedGeometry {
     surface_bounds: Option<Bounds<Pixels>>,
     /// Painted bounds of the last selected visual line, in window space.
     tail_bounds: Option<Bounds<Pixels>>,
+    /// Painted bounds of the current find match, in window space.
+    find_current_bounds: Option<Bounds<Pixels>>,
     /// Visible union of every painted selected line, in window space.
     selection_bounds: Option<Bounds<Pixels>>,
 }
@@ -90,6 +92,10 @@ pub struct TextSelection {
     last_scroll: Option<Instant>,
     /// A brief confirmation beside the text that was just copied.
     copied: Option<Copied>,
+    /// Find-in-transcript matches per leaf key: (range, is_current).
+    find: HashMap<SharedString, Vec<(Range<usize>, bool)>>,
+    /// Bumped whenever the logical document is replaced.
+    document_generation: u64,
 }
 
 struct Copied {
@@ -113,6 +119,8 @@ impl TextSelection {
             pointer: None,
             last_scroll: None,
             copied: None,
+            find: HashMap::new(),
+            document_generation: 0,
         }
     }
 
@@ -160,6 +168,7 @@ impl TextSelection {
         }
         self.document = document;
         self.document_index = index;
+        self.document_generation = self.document_generation.wrapping_add(1);
     }
 
     pub fn is_dragging(&self) -> bool {
@@ -251,6 +260,48 @@ impl TextSelection {
                 },
             )
         })
+    }
+
+    /// Replace find-in-transcript highlights. `current` indexes `matches`.
+    pub fn set_find_matches(
+        &mut self,
+        matches: &[(SharedString, Range<usize>)],
+        current: Option<usize>,
+    ) {
+        self.find.clear();
+        for (index, (key, range)) in matches.iter().enumerate() {
+            self.find
+                .entry(key.clone())
+                .or_default()
+                .push((range.clone(), Some(index) == current));
+        }
+        // Bounds from the last paint belong to the previous current match.
+        self.painted.borrow_mut().find_current_bounds = None;
+    }
+
+    /// Find matches painted in this leaf: (range, is_current).
+    pub fn find_matches(&self, key: &str) -> &[(Range<usize>, bool)] {
+        self.find.get(key).map_or(&[], Vec::as_slice)
+    }
+
+    /// Window-space bounds of the current find match from the last paint.
+    pub fn find_current_bounds(&self) -> Option<Bounds<Pixels>> {
+        self.painted.borrow().find_current_bounds
+    }
+
+    /// Changes whenever `set_document` installs a different document.
+    pub fn document_generation(&self) -> u64 {
+        self.document_generation
+    }
+
+    /// The complete logical document (key, plain text) in transcript order.
+    pub fn document(&self) -> &[(SharedString, SharedString)] {
+        &self.document
+    }
+
+    /// The currently selected text, if any (used to prefill find).
+    pub fn selection_text(&self) -> Option<String> {
+        self.selected_text()
     }
 
     fn selected_text(&self) -> Option<String> {
@@ -657,6 +708,7 @@ pub fn selectable_with_prefix(
             canvas(
                 |_, _, _| (),
                 move |bounds, _, window, cx| {
+                    paint_find_matches(&model, &key, &layout, prefix_len, text.len(), window, cx);
                     if let Some(range) = model.read(cx).range_for(&key, text.len())
                         && !range.is_empty()
                     {
@@ -834,6 +886,7 @@ pub fn surface(model: Entity<TextSelection>, list: Option<ListState>) -> gpui::A
                 painted.surface_bounds = Some(bounds);
                 // Leaves repaint after the surface and rebuild the union.
                 painted.selection_bounds = None;
+                painted.find_current_bounds = None;
             }
             let moved = model.clone();
             window.on_mouse_event(move |event: &MouseMoveEvent, phase, _, cx| {
@@ -1002,6 +1055,46 @@ fn selected_line_bounds(
         line_start += line.len() + 1;
     }
     result
+}
+
+/// Paint find-in-transcript matches behind a leaf's text: all matches subtle,
+/// the current one strong. Records the current match's visible bounds.
+fn paint_find_matches(
+    model: &Entity<TextSelection>,
+    key: &SharedString,
+    layout: &TextLayout,
+    prefix_len: usize,
+    text_len: usize,
+    window: &mut Window,
+    cx: &App,
+) {
+    let selection = model.read(cx);
+    let matches = selection.find_matches(key);
+    if matches.is_empty() {
+        return;
+    }
+    let accent = to_hsla(Theme::global().ACCENT);
+    for (range, current) in matches {
+        let start = range.start.min(text_len) + prefix_len;
+        let end = range.end.min(text_len) + prefix_len;
+        if start >= end {
+            continue;
+        }
+        let lines = selected_line_bounds(layout, start..end, window.text_style().text_align);
+        let color = if *current {
+            accent.opacity(0.55)
+        } else {
+            accent.opacity(0.22)
+        };
+        for (line, _, _) in &lines {
+            window.paint_quad(gpui::fill(*line, color).corner_radii(px(2.)));
+        }
+        if *current
+            && let Some(union) = lines.iter().map(|(line, _, _)| *line).reduce(|a, b| a.union(&b))
+        {
+            selection.painted.borrow_mut().find_current_bounds = Some(union);
+        }
+    }
 }
 
 /// Paint touching selected rows as one continuous, softly stepped shape.
