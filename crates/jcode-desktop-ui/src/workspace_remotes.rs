@@ -218,7 +218,8 @@ impl Workspace {
                 panel.status = format!("Retrying connection to {host}…");
                 cx.notify();
             });
-            self.create_remote_draft_session(host.clone(), request_id, cx);
+            let directory = panel.read(cx).working_dir.clone();
+            self.create_remote_draft_session(host.clone(), request_id, directory, cx);
         } else if panel.read(cx).is_startup_draft() && !local {
             self.remotes
                 .cloud_progress
@@ -472,12 +473,14 @@ impl Workspace {
     }
 
     /// A local favorite must never be passed to a different filesystem. Remote
-    /// defaults start in the remote home, while explicit local folder actions
+    /// defaults start in the remote home unless the draft names a directory on
+    /// that machine (Open folder, New session beside a remote panel), while explicit local folder actions
     /// and terminal panels continue to refer to this computer.
     pub(super) fn create_remote_draft_session(
         &mut self,
         host: String,
         request_id: String,
+        working_dir: Option<String>,
         cx: &mut Context<Self>,
     ) {
         let host = if managed_destination(&host) {
@@ -518,7 +521,7 @@ impl Workspace {
         } else {
             self.bridge.send(Command::CreateRemoteSession {
                 host,
-                working_dir: None,
+                working_dir,
                 request_id: Some(request_id),
             });
         }
