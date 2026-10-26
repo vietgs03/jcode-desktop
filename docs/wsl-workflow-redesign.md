@@ -124,9 +124,36 @@ Giới hạn: log tải 200 commit đầu, cuộn tải thêm. Diff cắt 2MB nh
 
 Mỗi đợt có GPUI test trên Windows với WSL thật, hot reload vào app để bạn thử.
 
-## 6. Cần bạn quyết
+## 6. Quyết định (user chốt 26/10)
 
-1. Click 1 lần trong Session browser = preview, Enter/double-click = mở. Đồng ý?
-2. Review view: mở dạng cột cạnh panel (như Changes hiện tại) hay toàn màn hình như Swarms?
-3. Revert lượt agent / discard file: có cần ngay đợt 2 không, hay chỉ xem trước?
-4. Thanh "Machine" mặc định WSL: có cần máy Local Windows nữa không, hay ẩn đi?
+1. Session browser: click 1 lần = chọn + preview, Enter / double-click / nút Resume = mở.
+2. Review: chọn theo UX chuyên nghiệp nhất hiện nay (xem 6.1).
+3. Revert lượt agent / discard / stage-commit: để đợt 3.
+4. Giữ cả Windows và WSL, đổi qua lại như VS Code Remote (xem 6.2).
+
+### 6.1 Review: bố cục chọn
+
+Tham khảo: Warp Code Review panel (docs.warp.dev/code/code-review), Zed Project Diff +
+Git Graph, Cursor agent review. Điểm chung của các tool tốt nhất:
+- Review là **pane dock bên phải cuộc chat**, không che chat, vì giá trị chính là vừa xem diff
+  vừa nói tiếp với agent. Có nút phóng to toàn màn hình (Ctrl+Shift+Enter / nút ⤢) và
+  kéo đổi độ rộng.
+- **Một luồng diff cuộn liên tục** (mọi file xếp chồng như multibuffer của Zed / Warp),
+  bên trái là **cây file** có +/-; click file = cuộn tới file đó, không mở view riêng.
+- **Bộ chọn phạm vi** ở header: `Uncommitted` | `vs main` | `vs nhánh…` | `Lượt agent #N` |
+  `Commit abc123`. Cùng một vùng diff hiển thị mọi phạm vi.
+- **Tab History**: commit graph bên trái pane, chọn commit thì diff hiện ngay bên cạnh
+  (không đè lên graph, điều người dùng Zed đang xin).
+- **Lối vào**: chip `+A -D` ở chân panel (đã có), nút "Review changes" cuối mỗi lượt agent
+  có sửa file (như Warp), Ctrl+Alt+G, `/review`.
+- **Gửi diff cho agent**: nút "Attach to chat" trên file / hunk, chèn đoạn diff vào ô nhập.
+- Cập nhật realtime sau mỗi lượt agent và khi file đổi (đã có cơ chế refresh TurnDone).
+
+### 6.2 Đổi Windows / WSL như VS Code Remote
+
+- Góc trái dưới sidebar có **Remote indicator**: `>< WSL: Ubuntu` hoặc `>< Windows`.
+  Click mở menu: `Windows (local)`, từng distro WSL, các SSH host đã lưu, `Open folder…`.
+- Đổi máy = đổi ngữ cảnh cho mọi thao tác mới (Open folder, New session, terminal, gợi ý
+  project). Session đang mở giữ nguyên máy của nó, mỗi panel có badge máy.
+- Lưu lựa chọn bằng `persist_default_remote_host` (đã có). Mỗi cửa sổ có thể khác nhau.
+- Command palette: `Open Folder in WSL…`, `Open Folder in Windows…`, `Switch to WSL/Windows`.
