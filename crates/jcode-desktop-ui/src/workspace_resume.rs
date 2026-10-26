@@ -51,6 +51,75 @@ pub(super) struct State {
     content_query: Option<String>,
     content_cancel: Arc<AtomicBool>,
     content_task: Option<gpui::Task<()>>,
+    /// Machine and repository filters, and grouping rows by repository.
+    machine: Machine,
+    repo: Option<String>,
+    repo_menu: bool,
+    group_by_repo: bool,
+    /// Stored-record details by session ID, read off the UI thread.
+    meta: HashMap<String, Result<SessionMeta, String>>,
+    meta_task: Option<gpui::Task<()>>,
+    /// Git branch by working directory (`None` outside Git), probed in batches.
+    branches: HashMap<String, Option<String>>,
+    branch_task: Option<gpui::Task<()>>,
+    /// A remote preview is waiting for `Update::ProvisionalHistory`.
+    peek_pending: Option<String>,
+    /// The remote preview asked for the full stored history.
+    preview_full: bool,
+    /// Child index of each match in the results list (headers shift them).
+    row_children: Vec<usize>,
+}
+
+pub(super) use jcode_desktop_harness::session_meta::SessionMeta;
+
+/// Messages a remote preview asks for, and for "Load full history".
+const PEEK_PREVIEW: u32 = 60;
+const PEEK_FULL: u32 = 5_000;
+const PEEK_TIMEOUT: Duration = Duration::from_secs(25);
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) enum Machine {
+    #[default]
+    All,
+    Wsl,
+    Local,
+}
+
+/// Where a session runs, as the browser labels it.
+fn session_machine(session_id: &str) -> (Machine, String) {
+    match harness::remote_host(session_id) {
+        None if cfg!(windows) => (Machine::Local, "Windows".into()),
+        None => (Machine::Local, "Local".into()),
+        Some(host) => match jcode_sdk::wsl_distro(&host) {
+            Some(Some(distro)) => (Machine::Wsl, format!("WSL: {distro}")),
+            Some(None) => (Machine::Wsl, "WSL".into()),
+            None => (Machine::All, host),
+        },
+    }
+}
+
+fn local_machine_label() -> &'static str {
+    if cfg!(windows) { "Windows" } else { "Local" }
+}
+
+/// The repository a session belongs to: its folder name.
+fn session_repo(session: &jcode_sdk::SessionInfo) -> Option<String> {
+    let dir = session.working_dir.as_deref()?.trim().trim_end_matches(['/', '\\']);
+    let name = dir.rsplit(['/', '\\']).next()?;
+    (!name.is_empty()).then(|| name.to_owned())
+}
+
+fn branch_key(location: &jcode_desktop_harness::session_git::Location, dir: &str) -> String {
+    format!("{location:?}\u{1f}{dir}")
+}
+
+/// `2026-10-23 14:02 UTC` from an RFC 3339 timestamp.
+fn short_timestamp(value: &str) -> String {
+    match value.get(..16) {
+        Some(head) if value.ends_with('Z') => format!("{} UTC", head.replace('T', " ")),
+        Some(head) => head.replace('T', " "),
+        None => value.to_owned(),
+    }
 }
 
 /// Let typing settle before scanning every stored transcript.
@@ -280,7 +349,7 @@ impl Workspace {
         let Some(state) = &self.resume else {
             return Vec::new();
         };
-        filtered_sessions(
+        let mut sessions = filtered_sessions(
             self.resume_sessions(cx),
             &state.query,
             state.filter,
@@ -291,7 +360,39 @@ impl Workspace {
                 .filter(|query| **query == state.query)
                 .map(|_| &state.content_hits)
                 .unwrap_or(&content_search::Hits::new()),
-        )
+        );
+        sessions.retain(|session| {
+            (state.machine == Machine::All
+                || session_machine(&session.session_id).0 == state.machine)
+                && state
+                    .repo
+                    .as_ref()
+                    .is_none_or(|repo| session_repo(session).as_ref() == Some(repo))
+        });
+        if state.group_by_repo {
+            // Stable: recency order is kept inside each repository group.
+            sessions.sort_by_cached_key(|session| {
+                session_repo(session).map(|repo| repo.to_lowercase())
+                    .unwrap_or_else(|| "\u{10ffff}".into())
+            });
+        }
+        sessions
+    }
+
+    /// Repositories in the catalog after the machine filter, by name.
+    fn resume_repos(&self, cx: &App) -> Vec<String> {
+        let machine = self.resume.as_ref().map(|s| s.machine).unwrap_or_default();
+        let mut repos: Vec<String> = self
+            .resume_sessions(cx)
+            .iter()
+            .filter(|s| !s.archived)
+            .filter(|s| machine == Machine::All || session_machine(&s.session_id).0 == machine)
+            .filter_map(session_repo)
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect();
+        repos.sort_by_key(|repo| repo.to_lowercase());
+        repos
     }
 
     /// Whether the transcript scan for the current query is still running.
@@ -424,6 +525,17 @@ impl Workspace {
             content_query: None,
             content_cancel: Arc::new(AtomicBool::new(false)),
             content_task: None,
+            machine: Machine::All,
+            repo: None,
+            repo_menu: false,
+            group_by_repo: false,
+            meta: HashMap::new(),
+            meta_task: None,
+            branches: HashMap::new(),
+            branch_task: None,
+            peek_pending: None,
+            preview_full: false,
+            row_children: Vec::new(),
         });
         let presence = Self::watch_resume_presence(cx);
         if let Some(state) = self.resume.as_mut() {
@@ -442,6 +554,13 @@ impl Workspace {
     }
 
     fn resume_selected(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.resume_selected_in(false, window, cx);
+    }
+
+    /// Open the selected row. `separate` (Ctrl+Enter) keeps the current chat:
+    /// a standalone window opens the session in its own window, while the
+    /// panel strip already adds it next to the current panel.
+    fn resume_selected_in(&mut self, separate: bool, window: &mut Window, cx: &mut Context<Self>) {
         let matches = self.resume_matches(cx);
         let selected = self.resume.as_ref().and_then(|s| s.selected.as_deref());
         let Some(session) = matches
@@ -453,7 +572,32 @@ impl Workspace {
             return;
         };
         self.resume = None;
+        if separate && self.single_panel {
+            self.open_fork_window(&session.session_id);
+            self.focus_active(window, cx);
+            cx.notify();
+            return;
+        }
         self.resume_session(session, window, cx);
+    }
+
+    /// Single click selects and previews. Double click opens.
+    fn click_resume_row(
+        &mut self,
+        id: &str,
+        event: &gpui::ClickEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(state) = &mut self.resume else { return };
+        state.selected = Some(id.to_owned());
+        state.repo_menu = false;
+        if event.click_count() >= 2 {
+            self.resume_selected(window, cx);
+        } else {
+            window.focus(&state.search.focus_handle(cx), cx);
+            cx.notify();
+        }
     }
 
     /// Open a session named on the command line. The catalog has not loaded
@@ -523,8 +667,19 @@ impl Workspace {
     ) {
         let key = event.keystroke.key.as_str();
         match key {
-            "escape" => self.close_resume(window, cx),
-            "enter" => self.resume_selected(window, cx),
+            "escape" => {
+                if self.resume.as_ref().is_some_and(|s| s.repo_menu) {
+                    self.resume.as_mut().unwrap().repo_menu = false;
+                    cx.notify();
+                } else {
+                    self.close_resume(window, cx)
+                }
+            }
+            "enter" => self.resume_selected_in(
+                event.keystroke.modifiers.control || event.keystroke.modifiers.platform,
+                window,
+                cx,
+            ),
             "1" | "2" | "3" | "4" if event.keystroke.modifiers.control => {
                 self.set_resume_filter(
                     match key {
@@ -556,9 +711,30 @@ impl Workspace {
                 _ => (current + 1).min(matches.len().saturating_sub(1)),
             };
             state.selected = matches.get(next).map(|s| s.session_id.clone());
-            state.scroll.scroll_to_item(next);
+            let child = state.row_children.get(next).copied().unwrap_or(next);
+            state.scroll.scroll_to_item(child);
             cx.notify();
         }
+    }
+
+    fn set_resume_machine(&mut self, machine: Machine, cx: &mut Context<Self>) {
+        if let Some(state) = &mut self.resume {
+            state.machine = machine;
+            state.repo = None;
+            state.selected = None;
+            state.scroll.scroll_to_item(0);
+        }
+        cx.notify();
+    }
+
+    fn set_resume_repo(&mut self, repo: Option<String>, cx: &mut Context<Self>) {
+        if let Some(state) = &mut self.resume {
+            state.repo = repo;
+            state.repo_menu = false;
+            state.selected = None;
+            state.scroll.scroll_to_item(0);
+        }
+        cx.notify();
     }
 
     fn set_resume_filter(&mut self, filter: Filter, cx: &mut Context<Self>) {
@@ -619,8 +795,21 @@ impl Workspace {
         let search = state.search.clone();
         let scroll = state.scroll.clone();
         let filter = state.filter;
+        let group_by_repo = state.group_by_repo;
+        let machine_filter = state.machine;
+        let repo_filter = state.repo.clone();
+        let repo_menu = state.repo_menu;
         self.load_resume_preview(selected.as_deref(), cx);
+        self.load_resume_branches(&matches, cx);
+        let repos = if repo_menu { self.resume_repos(cx) } else { Vec::new() };
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or_default();
         let theme = Theme::global();
+        let mut row_children = Vec::with_capacity(matches.len());
+        let mut child_count = 0usize;
+        let mut last_group: Option<Option<String>> = None;
         let mut rows = div()
             .id("resume-results")
             .flex_1()
@@ -642,12 +831,65 @@ impl Workspace {
                 Liveness::Open => "open".to_string(),
                 Liveness::Crashed | Liveness::Inactive => session.status.clone(),
             };
-            let metadata = format!(
-                "{}{} · {}",
-                saved_marker,
-                status,
-                sidebar_session_meta(session).unwrap_or_else(|| "Session history".into())
-            );
+            let repo = session_repo(session);
+            if group_by_repo && last_group.as_ref() != Some(&repo) {
+                let header = repo.clone().unwrap_or_else(|| "No repository".into());
+                let group = child_count;
+                rows = rows.child(
+                    div()
+                        .id(("resume-group", group))
+                        .debug_selector(move || format!("resume-group-{group}"))
+                        .px_3()
+                        .pt_2()
+                        .pb_1()
+                        .text_size(px(11.0))
+                        .text_color(theme.TEXT_FAINT)
+                        .text_ellipsis()
+                        .child(header),
+                );
+                child_count += 1;
+                last_group = Some(repo.clone());
+            }
+            row_children.push(child_count);
+            child_count += 1;
+            let meta = self
+                .resume
+                .as_ref()
+                .and_then(|s| s.meta.get(&session.session_id))
+                .and_then(|m| m.as_ref().ok());
+            let when = session
+                .last_active_at_ms
+                .or(session.updated_at_ms)
+                .filter(|ms| *ms > 0)
+                .map(|ms| format_time_ago(ms as u64, now_ms));
+            let place = [
+                repo.clone().or_else(|| {
+                    session.working_dir.as_deref().map(compact_working_dir)
+                }),
+                self.resume_branch(session),
+                when,
+                Some(session_machine(&session.session_id).1),
+            ]
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>()
+            .join(" · ");
+            let counts = match meta {
+                Some(meta) => [
+                    Some(format!(
+                        "{} msg",
+                        meta.user_messages + meta.assistant_messages
+                    )),
+                    meta.model.clone(),
+                    Some(format_estimated_tokens(meta.estimated_tokens())),
+                ]
+                .into_iter()
+                .flatten()
+                .collect::<Vec<_>>()
+                .join(" · "),
+                None => sidebar_session_meta(session).unwrap_or_else(|| "Session history".into()),
+            };
+            let metadata = format!("{saved_marker}{status} · {counts}");
             let badge =
                 resume_liveness_badge(live, open_spinners.get(&session.session_id).cloned(), index);
             let excerpt = excerpts.get(&session.session_id).cloned();
@@ -661,11 +903,8 @@ impl Workspace {
                     .rounded_md()
                     .when(is_selected, |el| el.bg(theme.TOOL_BG))
                     .hover(|el| el.bg(theme.TOOL_BG))
-                    .on_click(cx.listener(move |this, _, window, cx| {
-                        if let Some(state) = &mut this.resume {
-                            state.selected = Some(id.clone());
-                        }
-                        this.resume_selected(window, cx);
+                    .on_click(cx.listener(move |this, event: &gpui::ClickEvent, window, cx| {
+                        this.click_resume_row(&id, event, window, cx);
                     }))
                     .child(
                         div()
@@ -686,18 +925,18 @@ impl Workspace {
                             .text_size(px(12.0))
                             .text_color(theme.TEXT_DIM)
                             .text_ellipsis()
-                            .child(
-                                session
-                                    .working_dir
-                                    .as_deref()
-                                    .map(compact_working_dir)
-                                    .unwrap_or_else(|| "No working directory".into()),
-                            ),
+                            .child(if place.is_empty() {
+                                "No working directory".to_string()
+                            } else {
+                                place
+                            }),
                     )
                     .child(
                         div()
+                            .debug_selector(move || format!("resume-row-meta-{index}"))
                             .text_size(px(11.0))
                             .text_color(theme.TEXT_FAINT)
+                            .text_ellipsis()
                             .child(metadata),
                     )
                     .children(excerpt.map(|excerpt| {
@@ -709,6 +948,9 @@ impl Workspace {
                             .child(excerpt)
                     })),
             );
+        }
+        if let Some(state) = self.resume.as_mut() {
+            state.row_children = row_children;
         }
         if matches.is_empty() {
             rows = rows.child(div().p_4().text_color(theme.TEXT_DIM).child(
@@ -738,7 +980,15 @@ impl Workspace {
             .iter()
             .find(|s| Some(&s.session_id) == selected.as_ref())
         {
-            let (_, title) = sidebar_session_title(session);
+            let (icon, title) = sidebar_session_title(session);
+            let info = self.resume_info_lines(session, now_ms);
+            let preview_ready = matches!(
+                self.resume.as_ref().and_then(|s| s.preview.as_ref()),
+                Some(Ok(_))
+            );
+            let can_load_full = harness::remote_host(&session.session_id).is_some()
+                && preview_ready
+                && !self.resume.as_ref().is_some_and(|s| s.preview_full);
             let detail = [
                 Some(
                     session
@@ -769,20 +1019,80 @@ impl Workspace {
                     .flex()
                     .flex_col()
                     .gap_1()
-                    .child(div().text_size(px(16.0)).text_ellipsis().child(title))
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .text_size(px(16.0))
+                                    .text_ellipsis()
+                                    .child(format!("{icon} {title}")),
+                            )
+                            .when(can_load_full, |el| {
+                                el.child(
+                                    div()
+                                        .id("resume-load-full")
+                                        .debug_selector(|| "resume-load-full".into())
+                                        .flex_none()
+                                        .px_2()
+                                        .py_1()
+                                        .rounded_md()
+                                        .cursor_pointer()
+                                        .text_size(px(12.0))
+                                        .text_color(theme.TEXT_DIM)
+                                        .hover(|el| el.bg(theme.PANEL_BG))
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.load_full_resume_preview(cx)
+                                        }))
+                                        .child("Load full history"),
+                                )
+                            })
+                            .child(
+                                div()
+                                    .id("resume-open")
+                                    .debug_selector(|| "resume-open".into())
+                                    .flex_none()
+                                    .px_3()
+                                    .py_1()
+                                    .rounded_md()
+                                    .cursor_pointer()
+                                    .text_size(px(12.0))
+                                    .bg(theme.PANEL_BG)
+                                    .hover(|el| el.opacity(0.85))
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.resume_selected(window, cx)
+                                    }))
+                                    .child("Resume ⏎"),
+                            ),
+                    )
                     .child(
                         div()
                             .text_size(px(11.0))
                             .text_color(theme.TEXT_DIM)
                             .text_ellipsis()
                             .child(detail),
-                    ),
+                    )
+                    .children(info.into_iter().enumerate().map(|(line, text)| {
+                        div()
+                            .debug_selector(move || format!("resume-info-{line}"))
+                            .text_size(px(11.0))
+                            .text_color(theme.TEXT_DIM)
+                            .text_ellipsis()
+                            .child(text)
+                    })),
             );
             let transcript = match self
                 .resume
                 .as_ref()
                 .and_then(|state| state.preview.as_ref())
             {
+                None if harness::remote_host(&session.session_id).is_some() => {
+                    resume_preview_notice("Loading conversation from the remote machine…")
+                }
                 None => resume_preview_notice("Loading conversation…"),
                 Some(Err(error)) => resume_preview_notice(error.clone()),
                 Some(Ok(panel)) if panel.read(cx).items.is_empty() => {
@@ -895,6 +1205,124 @@ impl Workspace {
             .child(
                 div()
                     .flex()
+                    .flex_wrap()
+                    .items_center()
+                    .gap_2()
+                    .text_size(px(12.0))
+                    .child(div().text_color(theme.TEXT_DIM).child("Machine"))
+                    .children(
+                        [
+                            (Machine::All, "All", "resume-machine-all"),
+                            (Machine::Wsl, "WSL", "resume-machine-wsl"),
+                            (Machine::Local, local_machine_label(), "resume-machine-local"),
+                        ]
+                        .into_iter()
+                        .map(|(value, label, id)| {
+                            div()
+                                .id(id)
+                                .debug_selector(move || id.into())
+                                .px_2()
+                                .py_1()
+                                .rounded_md()
+                                .cursor_pointer()
+                                .when(value == machine_filter, |el| el.bg(theme.TOOL_BG))
+                                .hover(|el| el.bg(theme.TOOL_BG))
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.set_resume_machine(value, cx)
+                                }))
+                                .child(label)
+                        }),
+                    )
+                    .child(div().text_color(theme.TEXT_DIM).ml_2().child("Repo"))
+                    .child(
+                        div()
+                            .id("resume-repo")
+                            .debug_selector(|| "resume-repo".into())
+                            .px_2()
+                            .py_1()
+                            .rounded_md()
+                            .cursor_pointer()
+                            .bg(theme.TOOL_BG)
+                            .max_w(px(220.0))
+                            .text_ellipsis()
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                if let Some(state) = this.resume.as_mut() {
+                                    state.repo_menu = !state.repo_menu;
+                                }
+                                cx.notify();
+                            }))
+                            .child(format!(
+                                "{} ▾",
+                                repo_filter.clone().unwrap_or_else(|| "any".into())
+                            )),
+                    )
+                    .child(
+                        div()
+                            .id("resume-group-toggle")
+                            .debug_selector(|| "resume-group-toggle".into())
+                            .ml_2()
+                            .px_2()
+                            .py_1()
+                            .rounded_md()
+                            .cursor_pointer()
+                            .when(group_by_repo, |el| el.bg(theme.TOOL_BG))
+                            .hover(|el| el.bg(theme.TOOL_BG))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                if let Some(state) = this.resume.as_mut() {
+                                    state.group_by_repo = !state.group_by_repo;
+                                }
+                                cx.notify();
+                            }))
+                            .child(if group_by_repo { "☑ Group by repo" } else { "☐ Group by repo" }),
+                    ),
+            )
+            .when(repo_menu, |el| {
+                el.child(
+                    div()
+                        .id("resume-repo-menu")
+                        .debug_selector(|| "resume-repo-menu".into())
+                        .flex()
+                        .flex_wrap()
+                        .gap_1()
+                        .p_2()
+                        .rounded_md()
+                        .bg(theme.TOOL_BG)
+                        .text_size(px(12.0))
+                        .max_h(px(140.0))
+                        .overflow_y_scroll()
+                        .child(
+                            div()
+                                .id("resume-repo-any")
+                                .debug_selector(|| "resume-repo-any".into())
+                                .px_2()
+                                .py_1()
+                                .rounded_md()
+                                .cursor_pointer()
+                                .hover(|el| el.bg(theme.PANEL_BG))
+                                .on_click(cx.listener(|this, _, _, cx| this.set_resume_repo(None, cx)))
+                                .child("any"),
+                        )
+                        .children(repos.into_iter().enumerate().map(|(i, repo)| {
+                            let label = repo.clone();
+                            div()
+                                .id(("resume-repo-option", i))
+                                .debug_selector(move || format!("resume-repo-option-{i}"))
+                                .px_2()
+                                .py_1()
+                                .rounded_md()
+                                .cursor_pointer()
+                                .when(repo_filter.as_ref() == Some(&repo), |el| el.bg(theme.PANEL_BG))
+                                .hover(|el| el.bg(theme.PANEL_BG))
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.set_resume_repo(Some(repo.clone()), cx)
+                                }))
+                                .child(label)
+                        })),
+                )
+            })
+            .child(
+                div()
+                    .flex()
                     .gap_4()
                     .flex_1()
                     .min_h_0()
@@ -909,7 +1337,7 @@ impl Workspace {
                     .child(preview),
             )
             .child(div().text_size(px(11.0)).text_color(theme.TEXT_DIM).child(
-                "↑ ↓ Navigate   Page Up / Down   Enter Resume   Esc Back   Ctrl+1/2/3/4 Filters",
+                "↑ ↓ Select   Page Up / Down   Enter / double-click Resume   Ctrl+Enter New panel   Esc Back   Ctrl+1/2/3/4 Filters",
             ))
     }
 
@@ -921,6 +1349,15 @@ impl Workspace {
         }
         state.preview_id = Some(id.to_owned());
         state.preview = None;
+        state.preview_full = false;
+        state.peek_pending = None;
+        state.preview_task = None;
+        self.load_resume_meta(id, cx);
+        if harness::remote_host(id).is_some() && !harness::screenshot_mode() {
+            self.peek_resume_preview(id.to_owned(), PEEK_PREVIEW, cx);
+            return;
+        }
+        let state = self.resume.as_mut().expect("resume picker is open");
         let id = id.to_owned();
         let requested_id = id.clone();
         let request = cx
@@ -946,6 +1383,248 @@ impl Workspace {
                 cx.notify();
             });
         }));
+    }
+
+    /// Remote records live on the other machine: ask the bridge for the
+    /// stored tail without attaching (`Command::PeekRemote`). The reply
+    /// arrives as `Update::ProvisionalHistory`, see [`Self::resume_peek_reply`].
+    fn peek_resume_preview(&mut self, id: String, limit: u32, cx: &mut Context<Self>) {
+        let Some(state) = self.resume.as_mut() else { return };
+        state.peek_pending = Some(id.clone());
+        self.bridge.send(Command::PeekRemote {
+            session_id: id.clone(),
+            limit,
+        });
+        // The bridge stays silent when a peek fails. Do not spin forever.
+        state.preview_task = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(PEEK_TIMEOUT).await;
+            let _ = this.update(cx, |this, cx| {
+                if let Some(state) = this.resume.as_mut()
+                    && state.peek_pending.as_ref() == Some(&id)
+                {
+                    state.peek_pending = None;
+                    if state.preview.is_none() {
+                        state.preview = Some(Err(
+                            "Preview unavailable: the remote session did not answer. Resume to load it."
+                                .into(),
+                        ));
+                    }
+                    cx.notify();
+                }
+            });
+        }));
+    }
+
+    /// Feed a remote peek reply into the browser preview. Returns whether the
+    /// reply was the browser's, so it is not also offered to panels.
+    pub(super) fn resume_peek_reply(
+        &mut self,
+        session_id: &str,
+        messages: &[jcode_sdk::HistoryMessage],
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(state) = self.resume.as_mut() else {
+            return false;
+        };
+        if state.peek_pending.as_deref() != Some(session_id)
+            || state.preview_id.as_deref() != Some(session_id)
+        {
+            return false;
+        }
+        state.peek_pending = None;
+        state.preview_task = None;
+        let panel = preview_panel(session_id.to_owned(), messages.to_vec(), Vec::new(), cx);
+        if let Some(state) = self.resume.as_mut() {
+            state.preview = Some(Ok(panel));
+        }
+        cx.notify();
+        true
+    }
+
+    fn load_full_resume_preview(&mut self, cx: &mut Context<Self>) {
+        let Some(state) = self.resume.as_mut() else { return };
+        let Some(id) = state.preview_id.clone() else { return };
+        state.preview_full = true;
+        state.preview = None;
+        self.peek_resume_preview(id, PEEK_FULL, cx);
+        cx.notify();
+    }
+
+    /// Read the stored record's details off the UI thread, once per session
+    /// version (the harness also caches by `updated_at`).
+    fn load_resume_meta(&mut self, id: &str, cx: &mut Context<Self>) {
+        let updated = self
+            .sessions
+            .iter()
+            .find(|s| s.session_id == id)
+            .and_then(|s| s.updated_at_ms);
+        let Some(state) = self.resume.as_mut() else { return };
+        if state.meta.contains_key(id) || cfg!(test) || harness::screenshot_mode() {
+            return;
+        }
+        let id = id.to_owned();
+        let key = id.clone();
+        let request = cx
+            .background_executor()
+            .spawn(async move { jcode_desktop_harness::session_meta::load(&key, updated) });
+        state.meta_task = Some(cx.spawn(async move |this, cx| {
+            let result = request.await;
+            let _ = this.update(cx, |this, cx| {
+                if let Some(state) = this.resume.as_mut() {
+                    state.meta.insert(id, result);
+                    cx.notify();
+                }
+            });
+        }));
+    }
+
+    /// Probe git branches for the listed working directories in the
+    /// background, one batch per machine. Never blocks rendering.
+    fn load_resume_branches(&mut self, matches: &[jcode_sdk::SessionInfo], cx: &mut Context<Self>) {
+        let Some(state) = self.resume.as_mut() else { return };
+        if state.branch_task.is_some() || cfg!(test) || harness::screenshot_mode() {
+            return;
+        }
+        let mut wanted: HashMap<jcode_desktop_harness::session_git::Location, Vec<String>> =
+            HashMap::new();
+        for session in matches.iter().take(80) {
+            let Some(dir) = session.working_dir.clone().filter(|d| !d.trim().is_empty()) else {
+                continue;
+            };
+            let Some(location) =
+                jcode_desktop_harness::session_git::Location::of_session(&session.session_id)
+            else {
+                continue;
+            };
+            let key = branch_key(&location, &dir);
+            if state.branches.contains_key(&key) {
+                continue;
+            }
+            let dirs = wanted.entry(location).or_default();
+            if !dirs.contains(&dir) {
+                dirs.push(dir);
+            }
+        }
+        if wanted.is_empty() {
+            return;
+        }
+        for (location, dirs) in &wanted {
+            for dir in dirs {
+                // Mark as probing so the next frame does not ask again.
+                state.branches.insert(branch_key(location, dir), None);
+            }
+        }
+        let request = cx.background_executor().spawn(async move {
+            let mut found = Vec::new();
+            for (location, dirs) in wanted {
+                let infos = jcode_desktop_harness::session_git::checkout_infos(&location, &dirs);
+                for (dir, info) in dirs.into_iter().zip(infos) {
+                    found.push((branch_key(&location, &dir), info.map(|info| info.branch)));
+                }
+            }
+            found
+        });
+        state.branch_task = Some(cx.spawn(async move |this, cx| {
+            let found = request.await;
+            let _ = this.update(cx, |this, cx| {
+                if let Some(state) = this.resume.as_mut() {
+                    state.branches.extend(found);
+                    state.branch_task = None;
+                    cx.notify();
+                }
+            });
+        }));
+    }
+
+    /// The info header under the preview title, like the CLI `/session`.
+    fn resume_info_lines(&self, session: &jcode_sdk::SessionInfo, now_ms: u64) -> Vec<String> {
+        let join = |parts: Vec<Option<String>>| {
+            parts.into_iter().flatten().collect::<Vec<_>>().join(" · ")
+        };
+        let mut lines = Vec::new();
+        let (_, machine) = session_machine(&session.session_id);
+        lines.push(join(vec![
+            session.working_dir.as_deref().map(compact_working_dir),
+            self.resume_branch(session).map(|b| format!("⎇ {b}")),
+            Some(machine),
+        ]));
+        let meta = self
+            .resume
+            .as_ref()
+            .and_then(|s| s.meta.get(&session.session_id));
+        let meta = match meta {
+            None => {
+                lines.push("Reading session details…".into());
+                None
+            }
+            Some(Err(error)) => {
+                lines.push(error.clone());
+                None
+            }
+            Some(Ok(meta)) => Some(meta),
+        };
+        let last_active = session
+            .last_active_at_ms
+            .or(session.updated_at_ms)
+            .filter(|ms| *ms > 0)
+            .map(|ms| format!("active {}", format_time_ago(ms as u64, now_ms)));
+        let created = meta
+            .and_then(|m| m.created_at.as_deref())
+            .map(|c| format!("created {}", short_timestamp(c)));
+        let when = join(vec![created, last_active]);
+        if !when.is_empty() {
+            lines.push(when);
+        }
+        if let Some(meta) = meta {
+            let model = match (&meta.model, &meta.provider) {
+                (Some(model), Some(provider)) => Some(format!("{model} ({provider})")),
+                (Some(model), None) => Some(model.clone()),
+                (None, provider) => provider.clone(),
+            };
+            lines.push(join(vec![
+                Some(format!(
+                    "{} messages ({} user, {} assistant)",
+                    meta.user_messages + meta.assistant_messages,
+                    meta.user_messages,
+                    meta.assistant_messages
+                )),
+                model,
+                Some(format!("~{}", format_estimated_tokens(meta.estimated_tokens()))),
+            ]));
+        }
+        let saved = session.saved.then(|| match &session.save_label {
+            Some(label) => format!("★ saved as {label}"),
+            None => "★ saved".into(),
+        });
+        let swarm = session.agent_label.as_ref().map(|label| match &session.swarm_status {
+            Some(status) => format!("swarm {label} ({status})"),
+            None => format!("swarm {label}"),
+        });
+        let agents = self
+            .sessions
+            .iter()
+            .filter(|s| s.parent_session_id.as_deref() == Some(session.session_id.as_str()))
+            .count();
+        let agents = (agents > 0).then(|| format!("coordinator of {agents} agents"));
+        let extra = join(vec![saved, swarm, agents]);
+        if !extra.is_empty() {
+            lines.push(extra);
+        }
+        if let Some(prompt) = meta.and_then(|m| m.first_prompt.as_deref()) {
+            let prompt: String = prompt.split_whitespace().collect::<Vec<_>>().join(" ");
+            let prompt: String = prompt.chars().take(200).collect();
+            lines.push(format!("“{prompt}”"));
+        }
+        lines.retain(|l| !l.is_empty());
+        lines
+    }
+
+    fn resume_branch(&self, session: &jcode_sdk::SessionInfo) -> Option<String> {
+        let state = self.resume.as_ref()?;
+        let dir = session.working_dir.as_deref()?;
+        let location =
+            jcode_desktop_harness::session_git::Location::of_session(&session.session_id)?;
+        state.branches.get(&branch_key(&location, dir))?.clone()
     }
 
     pub(super) fn init_resume_fixture(&mut self, cx: &App) {
@@ -1781,5 +2460,236 @@ mod tests {
                 vcx.run_until_parked();
             }
         }
+    }
+
+    fn watched(commands: &std::sync::mpsc::Receiver<harness::Command>) -> Vec<String> {
+        let mut out = Vec::new();
+        while let Ok(command) = commands.try_recv() {
+            if let harness::Command::Watch { session_id } = command {
+                out.push(session_id);
+            }
+        }
+        out
+    }
+
+    fn browser_with(
+        cx: &mut gpui::TestAppContext,
+        sessions: Vec<jcode_sdk::SessionInfo>,
+    ) -> (
+        Entity<Workspace>,
+        &mut gpui::VisualTestContext,
+        std::sync::mpsc::Receiver<harness::Command>,
+    ) {
+        let (bridge, commands) = harness::spawn_recording();
+        let (workspace, vcx) = cx.add_window_view(|_, cx| {
+            let mut w = Workspace::for_test(learning::Coach::new(), cx);
+            w.bridge = bridge;
+            w.open_startup_draft(cx);
+            w.sessions = sessions;
+            w
+        });
+        workspace.update_in(vcx, |w, window, cx| w.open_resume(&OpenResume, window, cx));
+        vcx.run_until_parked();
+        (workspace, vcx, commands)
+    }
+
+    fn click_row(vcx: &mut gpui::VisualTestContext, row: usize, count: usize) {
+        let bounds = vcx
+            .debug_bounds(Box::leak(format!("resume-row-{row}").into_boxed_str()))
+            .expect("row is rendered");
+        let position = bounds.center();
+        vcx.simulate_event(gpui::MouseDownEvent {
+            button: gpui::MouseButton::Left,
+            position,
+            click_count: count,
+            modifiers: Default::default(),
+            first_mouse: false,
+        });
+        vcx.simulate_event(gpui::MouseUpEvent {
+            button: gpui::MouseButton::Left,
+            position,
+            click_count: count,
+            modifiers: Default::default(),
+        });
+        vcx.run_until_parked();
+    }
+
+    #[gpui::test]
+    fn browser_single_click_selects_without_opening(cx: &mut gpui::TestAppContext) {
+        let (workspace, vcx, commands) = browser_with(
+            cx,
+            vec![session_info("first", Some("First")), session_info("second", Some("Second"))],
+        );
+        while commands.try_recv().is_ok() {}
+        click_row(vcx, 1, 1);
+        workspace.read_with(vcx, |w, _| {
+            let state = w.resume.as_ref().expect("browser stays open");
+            assert_eq!(state.selected.as_deref(), Some("second"));
+            assert_eq!(state.preview_id.as_deref(), Some("second"));
+        });
+        assert!(watched(&commands).is_empty(), "single click must not open");
+        assert!(vcx.debug_bounds("resume-open").is_some());
+    }
+
+    #[gpui::test]
+    fn browser_double_click_opens(cx: &mut gpui::TestAppContext) {
+        let (workspace, vcx, _commands) = browser_with(
+            cx,
+            vec![session_info("first", Some("First")), session_info("second", Some("Second"))],
+        );
+        click_row(vcx, 1, 1);
+        click_row(vcx, 1, 2);
+        workspace.read_with(vcx, |w, cx| {
+            assert!(w.resume.is_none());
+            assert_eq!(w.slots[w.active].panel.read(cx).session_id, "second");
+        });
+    }
+
+    #[gpui::test]
+    fn browser_enter_and_resume_button_open(cx: &mut gpui::TestAppContext) {
+        let (workspace, vcx, _commands) = browser_with(
+            cx,
+            vec![session_info("first", Some("First")), session_info("second", Some("Second"))],
+        );
+        vcx.simulate_keystrokes("down enter");
+        vcx.run_until_parked();
+        workspace.read_with(vcx, |w, cx| {
+            assert!(w.resume.is_none());
+            assert_eq!(w.slots[w.active].panel.read(cx).session_id, "second");
+        });
+        workspace.update_in(vcx, |w, window, cx| w.open_resume(&OpenResume, window, cx));
+        vcx.run_until_parked();
+        let button = vcx.debug_bounds("resume-open").expect("resume button");
+        vcx.simulate_click(button.center(), gpui::Modifiers::default());
+        vcx.run_until_parked();
+        workspace.read_with(vcx, |w, _| assert!(w.resume.is_none()));
+    }
+
+    #[gpui::test]
+    fn browser_wsl_preview_uses_peek_remote(cx: &mut gpui::TestAppContext) {
+        let id = "ssh://wsl/session_fox_1";
+        let mut wsl = session_info(id, Some("Fox"));
+        wsl.working_dir = Some("/home/v/go-chathub".into());
+        let (workspace, vcx, commands) = browser_with(cx, vec![wsl]);
+        let mut peeked = None;
+        while let Ok(command) = commands.try_recv() {
+            if let harness::Command::PeekRemote { session_id, limit } = command {
+                peeked = Some((session_id, limit));
+            }
+        }
+        assert_eq!(peeked, Some((id.to_string(), PEEK_PREVIEW)));
+        workspace.update_in(vcx, |w, _, cx| {
+            w.apply(
+                harness::Update::ProvisionalHistory {
+                    session_id: id.into(),
+                    messages: vec![
+                        jcode_sdk::HistoryMessage {
+                            response_stats: None,
+                            role: "user".into(),
+                            content: "fix the ladder".into(),
+                        },
+                        jcode_sdk::HistoryMessage {
+                            response_stats: None,
+                            role: "assistant".into(),
+                            content: "done".into(),
+                        },
+                    ],
+                },
+                cx,
+            );
+            let Some(Ok(panel)) = w.resume.as_ref().unwrap().preview.as_ref() else {
+                panic!("preview should hold the peeked transcript");
+            };
+            assert!(!panel.read(cx).items.is_empty());
+        });
+        vcx.run_until_parked();
+        let full = vcx.debug_bounds("resume-load-full").expect("load full button");
+        vcx.simulate_click(full.center(), gpui::Modifiers::default());
+        vcx.run_until_parked();
+        let mut full_limit = None;
+        while let Ok(command) = commands.try_recv() {
+            if let harness::Command::PeekRemote { limit, .. } = command {
+                full_limit = Some(limit);
+            }
+        }
+        assert_eq!(full_limit, Some(PEEK_FULL));
+        assert!(watched(&commands).is_empty());
+    }
+
+    #[gpui::test]
+    fn browser_header_shows_metadata(cx: &mut gpui::TestAppContext) {
+        let mut session = session_info("session_fox_1", Some("Fox"));
+        session.working_dir = Some("/home/v/go-chathub".into());
+        session.saved = true;
+        session.save_label = Some("ladder".into());
+        let (workspace, vcx, _commands) = browser_with(cx, vec![session]);
+        let lines = workspace.update_in(vcx, |w, _, _| {
+            let state = w.resume.as_mut().unwrap();
+            state.meta.insert(
+                "session_fox_1".into(),
+                Ok(SessionMeta {
+                    created_at: Some("2026-10-23T14:02:00Z".into()),
+                    model: Some("claude-opus".into()),
+                    provider: Some("claude".into()),
+                    user_messages: 38,
+                    assistant_messages: 104,
+                    first_prompt: Some("Fix the PvP ladder".into()),
+                    bytes: 324_000,
+                    ..Default::default()
+                }),
+            );
+            let session = w.sessions[0].clone();
+            w.resume_info_lines(&session, 0)
+        });
+        let text = lines.join("\n");
+        assert!(text.contains("142 messages (38 user, 104 assistant)"), "{text}");
+        assert!(text.contains("claude-opus (claude)"), "{text}");
+        assert!(text.contains("created 2026-10-23 14:02 UTC"), "{text}");
+        assert!(text.contains("saved as ladder"), "{text}");
+        assert!(text.contains("Fix the PvP ladder"), "{text}");
+        vcx.run_until_parked();
+        assert!(vcx.debug_bounds("resume-info-0").is_some());
+    }
+
+    #[gpui::test]
+    fn browser_machine_and_repo_filters(cx: &mut gpui::TestAppContext) {
+        let mut a = session_info("ssh://wsl/session_a", Some("A"));
+        a.working_dir = Some("/home/v/alpha".into());
+        let mut b = session_info("session_b", Some("B"));
+        b.working_dir = Some("/home/v/beta".into());
+        let mut c = session_info("ssh://wsl/session_c", Some("C"));
+        c.working_dir = Some("/home/v/beta".into());
+        let (workspace, vcx, _commands) = browser_with(cx, vec![a, b, c]);
+        let ids = |w: &Workspace, cx: &App| {
+            w.resume_matches(cx)
+                .into_iter()
+                .map(|s| s.session_id)
+                .collect::<Vec<_>>()
+        };
+        let wsl = vcx.debug_bounds("resume-machine-wsl").expect("machine filter");
+        vcx.simulate_click(wsl.center(), gpui::Modifiers::default());
+        vcx.run_until_parked();
+        workspace.read_with(vcx, |w, cx| {
+            assert_eq!(ids(w, cx), vec!["ssh://wsl/session_a", "ssh://wsl/session_c"]);
+            assert_eq!(w.resume_repos(cx), vec!["alpha", "beta"]);
+        });
+        workspace.update_in(vcx, |w, _, cx| w.set_resume_repo(Some("beta".into()), cx));
+        workspace.read_with(vcx, |w, cx| {
+            assert_eq!(ids(w, cx), vec!["ssh://wsl/session_c"]);
+        });
+        workspace.update_in(vcx, |w, _, cx| {
+            w.set_resume_machine(Machine::All, cx);
+            w.resume.as_mut().unwrap().group_by_repo = true;
+        });
+        vcx.run_until_parked();
+        workspace.read_with(vcx, |w, cx| {
+            // The open startup draft has no repository, so it groups last.
+            assert_eq!(
+                ids(w, cx)[..3],
+                ["ssh://wsl/session_a", "session_b", "ssh://wsl/session_c"]
+            );
+            assert_eq!(w.resume.as_ref().unwrap().row_children[..3], [1, 3, 4]);
+        });
+        assert!(vcx.debug_bounds("resume-group-0").is_some());
     }
 }

@@ -13,6 +13,7 @@ pub mod platform;
 pub mod remote_targets;
 pub mod session_git;
 pub mod session_git_history;
+pub mod session_meta;
 
 static CLIENT_VERSION: OnceLock<&'static str> = OnceLock::new();
 

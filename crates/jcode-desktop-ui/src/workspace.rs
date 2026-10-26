@@ -2334,6 +2334,9 @@ impl Workspace {
                 session_id,
                 messages,
             } => {
+                if self.resume_peek_reply(&session_id, &messages, cx) {
+                    return true;
+                }
                 for slot in &self.slots {
                     if slot.panel.read(cx).session_id == session_id {
                         slot.panel.update(cx, |panel, cx| {

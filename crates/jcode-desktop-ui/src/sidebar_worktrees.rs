@@ -408,6 +408,35 @@ impl Workspace {
                 ),
             )
             .child(
+                // Opens the session browser (same as /resume, Alt+R).
+                div()
+                    .id("sidebar-all-sessions")
+                    .debug_selector(|| "sidebar-all-sessions".into())
+                    .flex_none()
+                    .size(px(26.0))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded_full()
+                    .cursor_pointer()
+                    .bg(Theme::global().TOOL_BG)
+                    .text_size(px(12.0))
+                    .text_color(Theme::global().TEXT_DIM)
+                    .hover(|el| el.bg(Theme::global().PANEL_BG))
+                    .tooltip(|_, cx| {
+                        cx.new(|_| remotes::HeaderTooltip("All sessions (Alt+R)".into())).into()
+                    })
+                    .on_mouse_down(
+                        gpui::MouseButton::Left,
+                        cx.listener(|this, _, window, cx| {
+                            window.prevent_default();
+                            cx.stop_propagation();
+                            this.open_resume(&OpenResume, window, cx);
+                        }),
+                    )
+                    .child("☰"),
+            )
+            .child(
                 // Icon-only, like hide: four labelled pills do not fit 224px.
                 div()
                     .id("sidebar-new-collection")
