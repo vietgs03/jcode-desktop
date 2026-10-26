@@ -3,6 +3,11 @@
 Trạng thái: đề xuất, chưa code. Mục tiêu: dùng Desktop giống hệt flow CLI
 `cd ~/go-chathub/go-chathub && jcode`, nhưng có UI tốt hơn.
 
+Phạm vi: CHỈ sửa Jcode Desktop (repo `jcode-desktop`). Jcode CLI chỉ là ví dụ tham khảo
+về trải nghiệm (flow `cd` + `jcode`, màn `/session`), không đổi gì ở CLI. Dữ liệu còn thiếu
+(model, số tin nhắn, token...) Desktop tự đọc phần đầu file session qua `wsl.exe` trong
+`jcode-desktop-harness`, không sửa API của jcode.
+
 ## 0. Hiện trạng (đã đọc code, không đoán)
 
 | Chỗ | Đang làm gì | Vấn đề |
@@ -63,8 +68,8 @@ Bố cục 2 cột, giữ phím như CLI:
   `stored_tail_fast`) thay vì đọc file local. Hiển thị 60 tin nhắn cuối, nút "Load full".
 - **Info đầy đủ** như CLI: số tin nhắn (user/assistant), model, provider, token ước tính,
   ngày tạo, lần hoạt động cuối, prompt đầu tiên, nhánh git, máy, trạng thái swarm.
-  Cần bridge trả thêm các trường này trong `list_sessions` (đã có trong metadata session,
-  không cần parse transcript).
+  Desktop tự đọc phần metadata ở đầu file session (qua `wsl.exe`, chạy nền, có cache),
+  không sửa jcode CLI hay API của nó.
 - Lọc theo Repo và Machine, nhóm theo repo (giống sidebar Projects).
 
 ## 3. Code review kiểu Warp / Cursor
