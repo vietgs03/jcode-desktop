@@ -12634,15 +12634,17 @@ mod tests {
             workspace.update(cx, |workspace, cx| workspace.focus_active(window, cx))
         });
         vcx.run_until_parked();
+        // The pinned shortcuts open the favorite. Plain new-session shortcuts
+        // follow the active panel, which is the favorite draft by then.
         for (chord, expected) in [
             ("super-enter", Some(favorite.to_string_lossy().into_owned())),
             (
                 "ctrl-alt-enter",
                 Some(favorite.to_string_lossy().into_owned()),
             ),
-            ("super-n", default_working_dir()),
+            ("super-n", Some(favorite.to_string_lossy().into_owned())),
             ("super-;", Some(favorite.to_string_lossy().into_owned())),
-            ("super-'", default_working_dir()),
+            ("super-'", Some(favorite.to_string_lossy().into_owned())),
         ] {
             vcx.simulate_keystrokes(&platform_chord(chord));
             vcx.run_until_parked();
