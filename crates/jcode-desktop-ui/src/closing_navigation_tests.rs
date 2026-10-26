@@ -386,6 +386,8 @@ fn all_super_shortcuts_have_handlers(cx: &mut gpui::TestAppContext) {
                             .map(|key| key.unparse())
                             .collect::<Vec<_>>()
                             .join(" ")
+                            // GPUI spells the Super modifier "win-" on Windows.
+                            .replace("win-", "super-")
                             == *chord),
                     "{chord} does not map to its advertised action (composer={composer})"
                 );
