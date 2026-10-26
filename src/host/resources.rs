@@ -363,7 +363,7 @@ fn windows_terminal_command(working_dir: Option<&str>) -> anyhow::Result<Command
     command.env("TERM", "xterm-256color");
     command.env("TERM_PROGRAM", "jcode-desktop");
     command.env("COLORTERM", "truecolor");
-    command
+    Ok(command)
 }
 
 /// `[desktop.workspace] default_remote_host` when it names a WSL target
